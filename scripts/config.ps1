@@ -33,5 +33,5 @@ $ProjectConfig = [ordered]@{
     AppxFileName             = "MC_Java_1.0.0.0.appx"
     CertificateFileName      = "MC_DevMode.pfx"
     CertificatePassword      = "devmode"
-    DefaultCertificateSubject = "CN=MinecraftJavaUWP Dev"
+    DefaultCertificateSubject = "CN=BanditVault"
 }
