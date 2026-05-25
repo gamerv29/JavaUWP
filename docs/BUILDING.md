@@ -98,7 +98,7 @@ Run:
 This injects `patch/LoaderUtil.java` into your local Fabric Loader JAR to avoid
 the Xbox sandbox path canonicalization failure.
 
-## Run pre-launch script
+## Run Fabric environment to generate missing files for building
 
 Run:
 
