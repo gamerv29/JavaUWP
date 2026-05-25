@@ -98,6 +98,37 @@ Run:
 This injects `patch/LoaderUtil.java` into your local Fabric Loader JAR to avoid
 the Xbox sandbox path canonicalization failure.
 
+## Run pre-launch script
+
+Run:
+
+```powershell
+$gameDir   = (Resolve-Path .\staging\cache\gameDir).Path
+$assetsDir = (Resolve-Path .\staging\cache\assets).Path
+$clientJar = "$gameDir\versions\1.21.11\1.21.11.jar"
+$jars = @()
+Get-ChildItem -Recurse "$gameDir\libraries" -Filter "*.jar" | ForEach-Object { $jars += $_.FullName }
+$jars += $clientJar
+$cp = $jars -join ';'
+
+$javaArgs = @(
+    "-Dfabric.gameJarPath=$clientJar"
+    "-Duser.dir=$gameDir"
+    "-cp"; $cp
+    "net.fabricmc.loader.impl.launch.knot.KnotClient"
+    "--gameDir";     $gameDir
+    "--assetsDir";   $assetsDir
+    "--assetIndex";  "29"
+    "--version";     "fabric-loader-0.19.2-1.21.11"
+    "--username";    "DevPlayer"
+    "--uuid";        "00000000-0000-0000-0000-000000000000"
+    "--accessToken"; "0"
+    "--versionType"; "release"
+)
+& "$env:JAVA_HOME\bin\java.exe" @javaArgs
+```
+This generates the minecraft assets so the build script doesn't crash.
+
 ## Build Package
 
 Run:
