@@ -401,16 +401,17 @@ static bool PreloadJvm(const std::wstring& exeDir, const std::wstring& jreDir, c
 
     // Preload the JRE CRT/runtime DLLs from jre\bin so jvm.dll can resolve
     // its non-system imports while running inside the app package.
-    loadPackaged(L"jre\\bin\\msvcp140.dll", L"msvcp140.dll");
-    loadPackaged(L"jre\\bin\\vcruntime140.dll", L"vcruntime140.dll");
+	loadPackaged(L"jre\\bin\\vcruntime140.dll", L"vcruntime140.dll");
     loadPackaged(L"jre\\bin\\vcruntime140_1.dll", L"vcruntime140_1.dll");
-    loadPackaged(L"jre\\bin\\java.dll", L"java.dll");
+    loadPackaged(L"jre\\bin\\msvcp140.dll", L"msvcp140.dll");
     loadPackaged(L"jre\\bin\\jli.dll", L"jli.dll");
 
     *jvmModule = loadPackaged(L"jre\\bin\\server\\jvm.dll", L"jvm.dll");
     if (!*jvmModule) {
         return false;
     }
+	
+	loadPackaged(L"jre\\bin\\java.dll", L"java.dll");
 
     WriteLog(L"JVM DLLs loaded");
     return true;
