@@ -544,7 +544,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         return false;
     }
 
-    jclass mainClass = env->FindClass("net.fabricmc.loader.impl.launch.knot.KnotClient");
+    jclass mainClass = env->FindClass("net/fabricmc/loader/impl/launch/knot/KnotClient");
     if (!mainClass || CheckAndLogJavaException(env, L"FindClass(KnotClient)")) {
         return false;
     }
