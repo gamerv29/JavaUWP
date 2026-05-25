@@ -201,7 +201,6 @@ static bool SeedLocalRuntime(const std::wstring& packageDir, const std::wstring&
     CopyDirectoryContentsIfNeeded(gameSeedDir + L"\\bundled-mods", localDir + L"\\game\\mods");
     CopyDirectoryContentsIfNeeded(packageDir + L"\\assets", localDir + L"\\assets");
     CopyDirectoryContentsIfNeeded(packageDir + L"\\natives", localDir + L"\\natives");
-    CopyDirectoryContentsIfNeeded(packageDir + L"\\jre", localDir + L"\\jre");
     CopyFileIfNeeded(packageDir + L"\\xbox_security.properties", localDir + L"\\xbox_security.properties");
     WriteLog(L"LocalState runtime seed complete");
     return true;
@@ -489,6 +488,7 @@ static bool CheckAndLogJavaException(JNIEnv* env, const wchar_t* stage) {
 }
 
 static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
+    const std::wstring& jreDir,
     const std::wstring& gameDir,
     const std::wstring& assetsDir,
     const std::wstring& nativesDir,
@@ -497,7 +497,6 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::wstring& argsPath,
     const std::wstring& classPath)
 {
-    const std::wstring jreDir = exeDir + L"\\jre";
     const std::wstring jnaTmpDir = nativesDir;
     const std::wstring lwjglTmpDir = exeDir;
     const std::wstring logConfigPath = gameDir + L"\\log_configs\\client-uwp.xml";
@@ -690,8 +689,16 @@ public:
             SeedLocalRuntime(packageDir, exeDir);
         }
 
+        // Keep java.home under the installed package. Java security startup calls
+        // toRealPath() on conf\security\java.security, which fails from LocalState
+        // on the Xbox app container.
+        const std::wstring packageJreDir = packageDir + L"\\jre";
+        const std::wstring jreDir =
+            (exeDir != packageDir && GetFileAttributesW((packageJreDir + L"\\bin\\java.exe").c_str()) != INVALID_FILE_ATTRIBUTES)
+                ? packageJreDir
+                : exeDir + L"\\jre";
         const std::wstring gameDir = exeDir + L"\\game";
-        const std::wstring javaExe = exeDir + L"\\jre\\bin\\java.exe";
+        const std::wstring javaExe = jreDir + L"\\bin\\java.exe";
         const std::wstring assetsDir = exeDir + L"\\assets";
         const std::wstring nativesDir = exeDir + L"\\natives";
         const std::wstring minecraftVersion = kMinecraftVersionW;
@@ -724,6 +731,7 @@ public:
             }
         }
         WriteLogF(L"exeDir: %s", exeDir.c_str());
+        WriteLogF(L"jreDir: %s", jreDir.c_str());
         WriteLogF(L"java.exe  exists=%d", GetFileAttributesW(javaExe.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"gameDir   exists=%d", GetFileAttributesW(gameDir.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"clientJar exists=%d", GetFileAttributesW(clientJar.c_str()) != INVALID_FILE_ATTRIBUTES);
@@ -739,7 +747,7 @@ public:
             cp += fwd(jars[i]);
         }
         WriteLog(L"Launching embedded JVM");
-        if (!RunEmbeddedMinecraft(exeDir, gameDir, assetsDir, nativesDir, clientJar, javaLog, argsPath, cp)) {
+        if (!RunEmbeddedMinecraft(exeDir, jreDir, gameDir, assetsDir, nativesDir, clientJar, javaLog, argsPath, cp)) {
             WriteLog(L"Embedded JVM launch failed");
             return E_FAIL;
         }
