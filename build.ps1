@@ -5,7 +5,8 @@ param(
     [string]$FabricLoader,
     [string]$AssetIndex,
     [switch]$KeepStaging,
-    [switch]$SkipStopAppProcesses
+    [switch]$SkipStopAppProcesses,
+    [switch]$StopFileLockers
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,6 +19,8 @@ if ($FabricLoader) { $env:FABRIC_LOADER_VERSION = $FabricLoader }
 if ($AssetIndex)   { $env:MC_ASSET_INDEX = $AssetIndex }
 
 . (Join-Path $PSScriptRoot "scripts\common.ps1")
+
+Write-Host "=== Build preflight ==="
 
 $root = Resolve-RepoRoot
 $pkg = Get-ConfigPath "PackageContentDir"
@@ -176,7 +179,11 @@ public static class BuildRestartManager
     }
 
     $allProcesses = @(Get-CimInstance Win32_Process)
-    $lockProcessIds = @(Get-RestartManagerLockingProcessIds -Paths $LockPaths | Where-Object { $_ -and $_ -ne $PID })
+    $lockProcessIds = @()
+    if ($LockPaths -and $LockPaths.Count -gt 0) {
+        Write-Host "Checking file lockers..."
+        $lockProcessIds = @(Get-RestartManagerLockingProcessIds -Paths $LockPaths | Where-Object { $_ -and $_ -ne $PID })
+    }
 
     $matches = $allProcesses |
         Where-Object {
@@ -230,12 +237,13 @@ if (-not $SkipStopAppProcesses) {
     $manifestPath = Join-Path $root "MC.Xbox\Package.appxmanifest"
     [xml]$manifest = Get-Content $manifestPath
     $packageName = $manifest.Package.Identity.Name
+    $lockPaths = if ($StopFileLockers) { @((Join-Path $outDir $ProjectConfig.AppxFileName)) } else { @() }
     Stop-BuildBlockingProcesses `
         -PackageName $packageName `
         -RootPath $root `
         -PackageContentPath $pkg `
         -OutputPath (Join-Path $outDir $ProjectConfig.AppxFileName) `
-        -LockPaths @((Join-Path $outDir $ProjectConfig.AppxFileName))
+        -LockPaths $lockPaths
 }
 
 New-Item -ItemType Directory -Force -Path $buildDir, $outDir, $certDir, $mcBuildDir, $glfwBuildDir | Out-Null
@@ -421,12 +429,13 @@ $signtool = Get-ChildItem "${sdkRoot}bin\$sdkVer\x64\signtool.exe","${sdkRoot}bi
 if (-not $signtool) { $signtool = "signtool" }
 
 if (-not $SkipStopAppProcesses) {
+    $lockPaths = if ($StopFileLockers) { @($appx) } else { @() }
     Stop-BuildBlockingProcesses `
         -PackageName $packageName `
         -RootPath $root `
         -PackageContentPath $pkg `
         -OutputPath $appx `
-        -LockPaths @($appx)
+        -LockPaths $lockPaths
 }
 
 & $makeappx pack /d $pkg /p $appx /overwrite

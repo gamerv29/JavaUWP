@@ -291,6 +291,17 @@ static std::string w2a(const std::wstring& w) {
     return s;
 }
 
+static std::wstring a2w(const char* utf8) {
+    if (!utf8 || !*utf8) return {};
+    int sz = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+    if (sz <= 0) return {};
+
+    std::wstring w(sz, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, &w[0], sz);
+    if (!w.empty() && w.back() == L'\0') w.pop_back();
+    return w;
+}
+
 static std::wstring GetEnvVarString(const wchar_t* name) {
     const DWORD len = GetEnvironmentVariableW(name, nullptr, 0);
     if (len == 0) return std::wstring();
@@ -408,7 +419,72 @@ static bool PreloadJvm(const std::wstring& exeDir, const std::wstring& jreDir, c
 static bool CheckAndLogJavaException(JNIEnv* env, const wchar_t* stage) {
     if (!env->ExceptionCheck()) return false;
     WriteLogF(L"Java exception during %s", stage);
-    env->ExceptionDescribe();
+
+    jthrowable throwable = env->ExceptionOccurred();
+    env->ExceptionClear();
+
+    if (!throwable) {
+        WriteLog(L"Java exception object was null after ExceptionOccurred");
+        return true;
+    }
+
+    jclass stringWriterClass = env->FindClass("java/io/StringWriter");
+    jclass printWriterClass = env->FindClass("java/io/PrintWriter");
+    jclass throwableClass = env->FindClass("java/lang/Throwable");
+    if (!stringWriterClass || !printWriterClass || !throwableClass) {
+        WriteLog(L"Unable to load Java exception formatting classes");
+        env->ExceptionClear();
+        env->DeleteLocalRef(throwable);
+        return true;
+    }
+
+    jmethodID stringWriterCtor = env->GetMethodID(stringWriterClass, "<init>", "()V");
+    jmethodID printWriterCtor = env->GetMethodID(printWriterClass, "<init>", "(Ljava/io/Writer;)V");
+    jmethodID printStackTrace = env->GetMethodID(throwableClass, "printStackTrace", "(Ljava/io/PrintWriter;)V");
+    jmethodID toString = env->GetMethodID(stringWriterClass, "toString", "()Ljava/lang/String;");
+    if (!stringWriterCtor || !printWriterCtor || !printStackTrace || !toString || env->ExceptionCheck()) {
+        WriteLog(L"Unable to resolve Java exception formatting methods");
+        env->ExceptionClear();
+        env->DeleteLocalRef(throwable);
+        env->DeleteLocalRef(stringWriterClass);
+        env->DeleteLocalRef(printWriterClass);
+        env->DeleteLocalRef(throwableClass);
+        return true;
+    }
+
+    jobject stringWriter = env->NewObject(stringWriterClass, stringWriterCtor);
+    jobject printWriter = stringWriter ? env->NewObject(printWriterClass, printWriterCtor, stringWriter) : nullptr;
+    if (!stringWriter || !printWriter || env->ExceptionCheck()) {
+        WriteLog(L"Unable to create Java exception formatter");
+        env->ExceptionClear();
+        env->DeleteLocalRef(throwable);
+        env->DeleteLocalRef(stringWriterClass);
+        env->DeleteLocalRef(printWriterClass);
+        env->DeleteLocalRef(throwableClass);
+        return true;
+    }
+
+    env->CallVoidMethod(throwable, printStackTrace, printWriter);
+    jstring trace = static_cast<jstring>(env->CallObjectMethod(stringWriter, toString));
+    if (trace && !env->ExceptionCheck()) {
+        const char* utf8 = env->GetStringUTFChars(trace, nullptr);
+        if (utf8) {
+            const std::wstring wideTrace = a2w(utf8);
+            WriteLogF(L"Java exception stack:\n%s", wideTrace.c_str());
+            env->ReleaseStringUTFChars(trace, utf8);
+        }
+    } else {
+        WriteLog(L"Unable to stringify Java exception stack");
+        env->ExceptionClear();
+    }
+
+    if (trace) env->DeleteLocalRef(trace);
+    env->DeleteLocalRef(printWriter);
+    env->DeleteLocalRef(stringWriter);
+    env->DeleteLocalRef(throwable);
+    env->DeleteLocalRef(stringWriterClass);
+    env->DeleteLocalRef(printWriterClass);
+    env->DeleteLocalRef(throwableClass);
     return true;
 }
 
@@ -448,7 +524,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Xms512M");
     vmOptionStorage.push_back("--enable-native-access=ALL-UNNAMED");
     vmOptionStorage.push_back("-Djava.home=" + w2a(fwd(jreDir)));
-    vmOptionStorage.push_back("-Djava.security.properties=" + w2a(fwd(jreDir + L"\\conf\\security\\xbox.properties")));
+    vmOptionStorage.push_back("-Djava.security.properties==" + w2a(fwd(jreDir + L"\\conf\\security\\xbox.properties")));
     vmOptionStorage.push_back("-Djava.security.egd=file:/dev/./urandom");
     vmOptionStorage.push_back("-Djava.io.tmpdir=" + w2a(fwd(jnaTmpDir)));
     vmOptionStorage.push_back("-Djna.tmpdir=" + w2a(fwd(jnaTmpDir)));
