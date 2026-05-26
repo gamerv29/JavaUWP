@@ -96,7 +96,6 @@ To obtain those, use the official Minecraft launcher, create a 1.21.11 instance,
 ```text
 glfw.dll
 jemalloc.dll
-jna13953121187917853598.dll
 lwjgl.dll
 lwjgl_opengl.dll
 lwjgl_stb.dll
