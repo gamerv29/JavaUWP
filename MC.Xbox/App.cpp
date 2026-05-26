@@ -230,12 +230,24 @@ static void WriteLog(const wchar_t* msg) {
 }
 
 static void WriteLogF(const wchar_t* fmt, ...) {
-    wchar_t buf[4096];
     va_list args;
     va_start(args, fmt);
-    vswprintf_s(buf, fmt, args);
+
+    va_list sizeArgs;
+    va_copy(sizeArgs, args);
+    const int needed = _vscwprintf(fmt, sizeArgs);
+    va_end(sizeArgs);
+
+    if (needed <= 0) {
+        va_end(args);
+        WriteLog(L"WriteLogF: failed to format message");
+        return;
+    }
+
+    std::vector<wchar_t> buf(static_cast<size_t>(needed) + 1);
+    vswprintf_s(buf.data(), buf.size(), fmt, args);
     va_end(args);
-    WriteLog(buf);
+    WriteLog(buf.data());
 }
 
 static bool WriteHwndFile(const std::wstring& dir, HWND hwnd) {
