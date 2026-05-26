@@ -198,7 +198,6 @@ static bool SeedLocalRuntime(const std::wstring& packageDir, const std::wstring&
     WriteLogF(L"Game seed source: %s", gameSeedDir.c_str());
 
     CopyDirectoryContentsIfNeeded(gameSeedDir, localDir + L"\\game");
-    CopyDirectoryContentsIfNeeded(gameSeedDir + L"\\bundled-mods", localDir + L"\\game\\mods");
     CopyDirectoryContentsIfNeeded(packageDir + L"\\assets", localDir + L"\\assets");
     CopyDirectoryContentsIfNeeded(packageDir + L"\\natives", localDir + L"\\natives");
     CopyFileIfNeeded(packageDir + L"\\xbox_security.properties", localDir + L"\\xbox_security.properties");
@@ -493,6 +492,8 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::wstring& gameDir,
     const std::wstring& assetsDir,
     const std::wstring& nativesDir,
+    const std::wstring& bundledModsDir,
+    const std::wstring& userModsDir,
     const std::wstring& clientJar,
     const std::wstring& javaLog,
     const std::wstring& argsPath,
@@ -504,6 +505,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
 
     EnsureDirectoryTree(gameDir + L"\\logs");
     EnsureDirectoryTree(gameDir + L"\\crash-reports");
+    EnsureDirectoryTree(userModsDir);
 
     if (!RedirectStdStreams(javaLog)) {
         WriteLogF(L"Failed to redirect stdout/stderr errno=%d winerr=%u", errno, GetLastError());
@@ -526,6 +528,8 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Djava.home=" + w2a(fwd(jreDir)));
     vmOptionStorage.push_back("-Djava.security.properties==" + w2a(fwd(jreDir + L"\\conf\\security\\xbox.properties")));
     vmOptionStorage.push_back("-Djava.security.egd=file:/dev/./urandom");
+    vmOptionStorage.push_back("-Dfabric.noGui=true");
+    vmOptionStorage.push_back("-Djava.awt.headless=true");
     vmOptionStorage.push_back("-Djava.io.tmpdir=" + w2a(fwd(jnaTmpDir)));
     vmOptionStorage.push_back("-Djna.tmpdir=" + w2a(fwd(jnaTmpDir)));
     vmOptionStorage.push_back("-Djna.nosys=true");
@@ -536,6 +540,10 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Dorg.lwjgl.system.SharedLibraryExtractDirectory=" + w2a(fwd(lwjglTmpDir)));
     vmOptionStorage.push_back("-Dorg.lwjgl.glfw.libname=" + w2a(fwd(nativesDir + L"\\glfw.dll")));
     vmOptionStorage.push_back("-Dfabric.gameJarPath=" + w2a(fwd(clientJar)));
+    vmOptionStorage.push_back("-Dfabric.modsFolder=" + w2a(fwd(userModsDir)));
+    if (GetFileAttributesW(bundledModsDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        vmOptionStorage.push_back("-Dfabric.addMods=" + w2a(fwd(bundledModsDir)));
+    }
     vmOptionStorage.push_back("-Djava.class.path=" + w2a(classPath));
     vmOptionStorage.push_back("-Duser.dir=" + w2a(fwd(gameDir)));
     vmOptionStorage.push_back("-Dlog4j.configurationFile=" + w2a(fwd(logConfigPath)));
@@ -703,7 +711,17 @@ public:
         const std::wstring assetsDir = exeDir + L"\\assets";
         const std::wstring nativesDir = exeDir + L"\\natives";
         const std::wstring minecraftVersion = kMinecraftVersionW;
-        const std::wstring clientJar = gameDir + L"\\versions\\" + minecraftVersion + L"\\" + minecraftVersion + L".jar";
+        const std::wstring packageRuntimeDir = packageDir + L"\\runtime";
+        const std::wstring classpathGameDir =
+            (exeDir != packageDir && GetFileAttributesW((packageRuntimeDir + L"\\libraries").c_str()) != INVALID_FILE_ATTRIBUTES)
+                ? packageRuntimeDir
+                : gameDir;
+        const std::wstring bundledModsDir =
+            (exeDir != packageDir && GetFileAttributesW((packageRuntimeDir + L"\\bundled-mods").c_str()) != INVALID_FILE_ATTRIBUTES)
+                ? packageRuntimeDir + L"\\bundled-mods"
+                : gameDir + L"\\mods";
+        const std::wstring userModsDir = gameDir + L"\\user-mods";
+        const std::wstring clientJar = classpathGameDir + L"\\versions\\" + minecraftVersion + L"\\" + minecraftVersion + L".jar";
         const std::wstring argsPath = exeDir + L"\\java_args.txt";
         const std::wstring javaLog = exeDir + L"\\java_output.log";
 
@@ -733,12 +751,15 @@ public:
         }
         WriteLogF(L"exeDir: %s", exeDir.c_str());
         WriteLogF(L"jreDir: %s", jreDir.c_str());
+        WriteLogF(L"classpathGameDir: %s", classpathGameDir.c_str());
+        WriteLogF(L"bundledModsDir: %s", bundledModsDir.c_str());
+        WriteLogF(L"userModsDir: %s", userModsDir.c_str());
         WriteLogF(L"java.exe  exists=%d", GetFileAttributesW(javaExe.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"gameDir   exists=%d", GetFileAttributesW(gameDir.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"clientJar exists=%d", GetFileAttributesW(clientJar.c_str()) != INVALID_FILE_ATTRIBUTES);
 
         std::vector<std::wstring> jars;
-        CollectJars(gameDir + L"\\libraries", jars);
+        CollectJars(classpathGameDir + L"\\libraries", jars);
         jars.push_back(clientJar);
         WriteLogF(L"JAR count: %zu", jars.size());
 
@@ -748,7 +769,7 @@ public:
             cp += fwd(jars[i]);
         }
         WriteLog(L"Launching embedded JVM");
-        if (!RunEmbeddedMinecraft(exeDir, jreDir, gameDir, assetsDir, nativesDir, clientJar, javaLog, argsPath, cp)) {
+        if (!RunEmbeddedMinecraft(exeDir, jreDir, gameDir, assetsDir, nativesDir, bundledModsDir, userModsDir, clientJar, javaLog, argsPath, cp)) {
             WriteLog(L"Embedded JVM launch failed");
             return E_FAIL;
         }
