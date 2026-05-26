@@ -38,6 +38,22 @@ Current defaults:
 - LWJGL GLFW natives: `3.3.3`
 - JNA: `5.17.0`
 
+The main build accepts temporary overrides:
+
+```powershell
+.\build.ps1 -McVersion 1.21.11 -FabricLoader 0.19.2 -AssetIndex 29
+```
+
+These values are passed into setup helpers and into the generated host header used by `MC.Xbox\App.cpp`.
+
+For a real version bump, update:
+
+- `scripts/config.ps1`
+- `compat_mod/src/main/resources/fabric.mod.json`
+- `MC.Xbox/launch.ps1` if you still use that legacy launch helper
+
+Then recreate the local `gameDir`, assets, natives, remapped jars, and patched Fabric Loader.
+
 ## Mesa runtime
 
 The repo includes the Mesa UWP runtime folder:
@@ -61,8 +77,6 @@ $env:MESA_UWP_DIR = "C:\path\to\mesa-runtime"
 `RETROARCH_UWP_DIR` is still accepted as a fallback search path. RetroArch is not required.
 
 ## Fresh setup
-
-Download the repo.
 
 Create the local cache folders and place the Fabric installer here:
 
@@ -109,8 +123,8 @@ OpenAL.dll
 
 - Go to https://kqzz.github.io/mc-bearer-token/ and follow the instructions listed on there to obtain your accessToken
 - Go to https://mcuuid.net/ to obtain your account UUID
+- copy launch_auth.example.json and rename to launch_auth.json, then input the details below in this format.
 
-Input that information and your username into app.cpp around lines 570 - 578, replacing the placeholder credentials.
 
 ```cpp
 # replace these with your credentials
@@ -199,20 +213,6 @@ The build script:
 9. Generates UWP tile and splash assets from `MC.Xbox\Assets\Java_UWP_Icon.png`.
 10. Creates and signs `output\MC_Java_1.0.0.0.appx`.
 11. Deletes `staging\package` unless `-KeepStaging` is set.
-
-The main build accepts temporary overrides:
-
-```powershell
-.\build.ps1 -McVersion 1.21.11 -FabricLoader 0.19.2 -AssetIndex 29
-```
-
-These values are passed into setup helpers and into the generated host header used by `MC.Xbox\App.cpp`.
-
-For a real version bump, update:
-
-- `scripts/config.ps1`
-- `compat_mod/src/main/resources/fabric.mod.json`
-- `MC.Xbox/launch.ps1` if you still use that legacy launch helper
 
 ## Clean outputs
 
