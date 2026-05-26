@@ -684,6 +684,40 @@ public:
         }
         EnsureDirectoryTree(g_logDir);
 
+        // On Xbox, the B button is also treated as a UWP Back request. If it is
+        // not handled here, the shell can suspend/back out of the app before the
+        // game sees the controller input.
+        ComPtr<ISystemNavigationManagerStatics> navStatics;
+        HRESULT navHr = GetActivationFactory(
+            HStringReference(RuntimeClass_Windows_UI_Core_SystemNavigationManager).Get(),
+            navStatics.GetAddressOf());
+        if (SUCCEEDED(navHr)) {
+            ComPtr<ISystemNavigationManager> navManager;
+            navHr = navStatics->GetForCurrentView(navManager.GetAddressOf());
+            if (SUCCEEDED(navHr)) {
+                EventRegistrationToken token = {};
+                navHr = navManager->add_BackRequested(
+                    Callback<IEventHandler<BackRequestedEventArgs*>>(
+                        [](IInspectable*, IBackRequestedEventArgs* args) -> HRESULT {
+                            if (args) {
+                                args->put_Handled(TRUE);
+                            }
+                            WriteLog(L"SetWindow: BackRequested handled");
+                            return S_OK;
+                        }).Get(),
+                    &token);
+                if (SUCCEEDED(navHr)) {
+                    WriteLog(L"SetWindow: BackRequested handler installed");
+                } else {
+                    WriteLogF(L"SetWindow: add_BackRequested failed hr=0x%08X", navHr);
+                }
+            } else {
+                WriteLogF(L"SetWindow: GetForCurrentView failed hr=0x%08X", navHr);
+            }
+        } else {
+            WriteLogF(L"SetWindow: SystemNavigationManager activation failed hr=0x%08X", navHr);
+        }
+
         ComPtr<ICoreWindowInterop> interop;
         g_windowInteropHr = window->QueryInterface(IID_PPV_ARGS(&interop));
         if (SUCCEEDED(g_windowInteropHr)) {
