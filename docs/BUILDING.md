@@ -118,7 +118,8 @@ OpenAL.dll
 ```
 
 ## Obtain your account credentials
-THIS WILL ONLY BE NECESSARY UNTIL WE IMPLEMENT PROPER AUTHENTICATION.
+
+**THIS WILL ONLY BE NECESSARY UNTIL WE IMPLEMENT PROPER AUTHENTICATION.**
 
 - Go to https://kqzz.github.io/mc-bearer-token/ and follow the instructions listed on there to obtain your accessToken
 - Go to https://mcuuid.net/ to obtain your account UUID
@@ -245,3 +246,4 @@ To include all ignored files, including downloaded cache files:
 - Missing `client-intermediary.jar`: run the Fabric client once from the local desktop cache as shown above.
 - Missing native DLLs: fill `staging\cache\natives-1.21` with the native DLLs required by the Minecraft and LWJGL runtime.
 - Package signing failure: delete the ignored local `.pfx` under `staging\certs` and rerun `build.ps1`, or set `APPX_CERT_SUBJECT`.
+- If you can't find your appdata folder, type `%appdata%` into your address bar in your file explorer.
