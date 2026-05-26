@@ -283,6 +283,9 @@ Write-Host "=== Building GLFW CoreWindow shim ==="
 Write-Host "=== Building Xbox compatibility mod ==="
 & (Join-Path $root "compat_mod\build_compat_mod.ps1")
 
+Write-Host "=== Patching Fabric Loader for Xbox filesystem ==="
+& (Join-Path $root "scripts\patch-fabric.ps1")
+
 Write-Host "=== Assembling PackageContent ==="
 Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path (Join-Path $pkg "Assets") | Out-Null

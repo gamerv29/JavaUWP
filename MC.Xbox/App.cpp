@@ -529,12 +529,15 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Xmx4G");
     vmOptionStorage.push_back("-Xms512M");
     vmOptionStorage.push_back("--enable-native-access=ALL-UNNAMED");
+    vmOptionStorage.push_back("--add-opens=jdk.zipfs/jdk.nio.zipfs=ALL-UNNAMED");
     vmOptionStorage.push_back("-Djava.home=" + w2a(fwd(jreDir)));
     vmOptionStorage.push_back("-Djava.security.properties==" + w2a(fwd(jreDir + L"\\conf\\security\\xbox.properties")));
     vmOptionStorage.push_back("-Djava.security.egd=file:/dev/./urandom");
     vmOptionStorage.push_back("-Dfabric.noGui=true");
     vmOptionStorage.push_back("-Dfabric.log.file=" + w2a(fwd(fabricLogPath)));
     vmOptionStorage.push_back("-Dfabric.log.level=debug");
+    vmOptionStorage.push_back("-Dfabric.debug.throwDirectly=true");
+    vmOptionStorage.push_back("-Dmixin.debug.verbose=true");
     vmOptionStorage.push_back("-Djava.awt.headless=true");
     vmOptionStorage.push_back("-Djava.io.tmpdir=" + w2a(fwd(jnaTmpDir)));
     vmOptionStorage.push_back("-Djna.tmpdir=" + w2a(fwd(jnaTmpDir)));
