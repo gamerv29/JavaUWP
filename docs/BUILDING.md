@@ -123,7 +123,7 @@ THIS WILL ONLY BE NECESSARY UNTIL WE IMPLEMENT PROPER AUTHENTICATION.
 - Go to https://kqzz.github.io/mc-bearer-token/ and follow the instructions listed on there to obtain your accessToken
 - Go to https://mcuuid.net/ to obtain your account UUID
 
-Input that information and your username into app.cpp around lines 570 - 578, replacing all of the placeholder data.
+Input that information and your username into app.cpp around lines 570 - 578, replacing the placeholder credentials.
 
 ## Generate Fabric remapped jars
 
