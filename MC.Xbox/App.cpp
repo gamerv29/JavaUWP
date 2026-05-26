@@ -16,6 +16,9 @@
 #include <fcntl.h>
 #include <share.h>
 #include <errno.h>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 // ICoreWindowInterop is forward-declared without a GUID, so IID_PPV_ARGS
 // cannot use it directly. Redeclare it with the correct uuid here.
@@ -502,6 +505,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::wstring jnaTmpDir = nativesDir;
     const std::wstring lwjglTmpDir = exeDir;
     const std::wstring logConfigPath = gameDir + L"\\log_configs\\client-uwp.xml";
+    const std::wstring fabricLogPath = gameDir + L"\\logs\\fabric-loader.log";
 
     EnsureDirectoryTree(gameDir + L"\\logs");
     EnsureDirectoryTree(gameDir + L"\\crash-reports");
@@ -529,6 +533,8 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Djava.security.properties==" + w2a(fwd(jreDir + L"\\conf\\security\\xbox.properties")));
     vmOptionStorage.push_back("-Djava.security.egd=file:/dev/./urandom");
     vmOptionStorage.push_back("-Dfabric.noGui=true");
+    vmOptionStorage.push_back("-Dfabric.log.file=" + w2a(fwd(fabricLogPath)));
+    vmOptionStorage.push_back("-Dfabric.log.level=debug");
     vmOptionStorage.push_back("-Djava.awt.headless=true");
     vmOptionStorage.push_back("-Djava.io.tmpdir=" + w2a(fwd(jnaTmpDir)));
     vmOptionStorage.push_back("-Djna.tmpdir=" + w2a(fwd(jnaTmpDir)));
@@ -635,7 +641,24 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     }
 
     WriteLog(L"Invoking KnotClient.main via embedded JVM");
+    std::atomic<bool> javaMainRunning{ true };
+    std::thread javaMainWatchdog([&javaMainRunning]() {
+        unsigned seconds = 0;
+        while (javaMainRunning.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            seconds += 5;
+            if (javaMainRunning.load()) {
+                WriteLogF(L"KnotClient.main still running after %u seconds", seconds);
+            }
+        }
+    });
+
     env->CallStaticVoidMethod(mainClass, mainMethod, argv);
+    javaMainRunning.store(false);
+    if (javaMainWatchdog.joinable()) {
+        javaMainWatchdog.join();
+    }
+
     if (CheckAndLogJavaException(env, L"CallStaticVoidMethod(main)")) {
         return false;
     }
