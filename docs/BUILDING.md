@@ -105,6 +105,26 @@ staging\cache\natives-1.21\
 
 That folder is local only and ignored by git.
 
+To obtain those, use the official Minecraft launcher, create a 1.21.11 instance, launch it fully past the accessibility screen, close the game, then go to ".minecraft" in your appdata folder, search "*.dll" and grab these DLLs:
+
+```text
+glfw.dll
+jemalloc.dll
+jna13953121187917853598.dll
+lwjgl.dll
+lwjgl_opengl.dll
+lwjgl_stb.dll
+OpenAL.dll
+```
+
+## Obtain your account credentials
+THIS WILL ONLY BE NECESSARY UNTIL WE IMPLEMENT PROPER AUTHENTICATION.
+
+- Go to https://kqzz.github.io/mc-bearer-token/ and follow the instructions listed on there to obtain your accessToken
+- Go to https://mcuuid.net/ to obtain your account UUID
+
+Input that information and your username into app.cpp around lines 570 - 578, replacing all of the placeholder data.
+
 ## Generate Fabric remapped jars
 
 Fabric remapped jars are created by running the Fabric client once on the local desktop cache. This step is needed before the compatibility mod can compile.
