@@ -269,7 +269,7 @@ Push-Location (Join-Path $root "MC.Xbox")
 $env:INCLUDE = "$mcBuildDir;$($tools.MsvcRoot)\include;${sdkRoot}Include\$sdkVer\ucrt;${sdkRoot}Include\$sdkVer\shared;${sdkRoot}Include\$sdkVer\um;${sdkRoot}Include\$sdkVer\winrt;${sdkRoot}Include\$sdkVer\cppwinrt;$jreSrc\include;$jreSrc\include\win32"
 $env:LIB = "$($tools.MsvcRoot)\lib\x64;${sdkRoot}Lib\$sdkVer\ucrt\x64;${sdkRoot}Lib\$sdkVer\um\x64"
 
-& $tools.ClExe App.cpp /std:c++17 /EHsc /W3 /O2 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 /Fo"$mcBuildDir\" `
+& $tools.ClExe App.cpp /std:c++17 /EHsc /W3 /O2 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS /Fo"$mcBuildDir\" `
     /DWINAPI_FAMILY=WINAPI_FAMILY_APP `
     /link /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup /MACHINE:X64 `
     /OUT:"$mcExe" kernel32.lib shell32.lib runtimeobject.lib windowsapp.lib ole32.lib oleaut32.lib d2d1.lib dwrite.lib d3d11.lib dxgi.lib
