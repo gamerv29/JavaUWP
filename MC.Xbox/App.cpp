@@ -1705,6 +1705,37 @@ public:
 
         g_logDir = exeDir;
         EnsureDirectoryTree(g_logDir);
+        SetCurrentDirectoryW(exeDir.c_str());
+        SetEnvironmentVariableW(L"MC_RUNTIME_DIR", exeDir.c_str());
+
+        wchar_t lp[MAX_PATH];
+        swprintf_s(lp, L"%s\\mc_launch.log", exeDir.c_str());
+        FILE* clf = nullptr;
+        _wfopen_s(&clf, lp, L"w");
+        if (clf) fclose(clf);
+
+        WriteLog(L"=== MC.App Run() started ===");
+        WriteLogF(L"SetWindow called=%d", g_setWindowCalled ? 1 : 0);
+        WriteLogF(L"SetWindow QueryInterface hr=0x%08X", g_windowInteropHr);
+        WriteLogF(L"SetWindow get_WindowHandle hr=0x%08X", g_getWindowHandleHr);
+        WriteLogF(L"Stored HWND=0x%p", g_windowHandle);
+        wchar_t cwd[MAX_PATH] = {};
+        GetCurrentDirectoryW(MAX_PATH, cwd);
+        WriteLogF(L"cwd=%s", cwd);
+        if (g_windowHandle) {
+            if (WriteHwndFile(exeDir, g_windowHandle)) {
+                WriteLog(L"Run: rewrote hwnd.txt from stored HWND");
+            } else {
+                WriteLogF(L"Run: failed to rewrite hwnd.txt err=%u", GetLastError());
+            }
+        }
+
+        LaunchAuthConfig authConfig;
+        if (!ResolveLaunchAuthConfig(g_authWindow.Get(), authConfig)) {
+            WriteLog(L"Dynamic authentication failed");
+            return E_FAIL;
+        }
+
         if (exeDir != packageDir) {
             SeedLocalRuntime(packageDir, exeDir);
         }
@@ -1736,30 +1767,6 @@ public:
         const std::wstring argsPath = exeDir + L"\\java_args.txt";
         const std::wstring javaLog = exeDir + L"\\java_output.log";
 
-        SetCurrentDirectoryW(exeDir.c_str());
-        SetEnvironmentVariableW(L"MC_RUNTIME_DIR", exeDir.c_str());
-
-        wchar_t lp[MAX_PATH];
-        swprintf_s(lp, L"%s\\mc_launch.log", exeDir.c_str());
-        FILE* clf = nullptr;
-        _wfopen_s(&clf, lp, L"w");
-        if (clf) fclose(clf);
-
-        WriteLog(L"=== MC.App Run() started ===");
-        WriteLogF(L"SetWindow called=%d", g_setWindowCalled ? 1 : 0);
-        WriteLogF(L"SetWindow QueryInterface hr=0x%08X", g_windowInteropHr);
-        WriteLogF(L"SetWindow get_WindowHandle hr=0x%08X", g_getWindowHandleHr);
-        WriteLogF(L"Stored HWND=0x%p", g_windowHandle);
-        wchar_t cwd[MAX_PATH] = {};
-        GetCurrentDirectoryW(MAX_PATH, cwd);
-        WriteLogF(L"cwd=%s", cwd);
-        if (g_windowHandle) {
-            if (WriteHwndFile(exeDir, g_windowHandle)) {
-                WriteLog(L"Run: rewrote hwnd.txt from stored HWND");
-            } else {
-                WriteLogF(L"Run: failed to rewrite hwnd.txt err=%u", GetLastError());
-            }
-        }
         WriteLogF(L"exeDir: %s", exeDir.c_str());
         WriteLogF(L"jreDir: %s", jreDir.c_str());
         WriteLogF(L"classpathGameDir: %s", classpathGameDir.c_str());
@@ -1768,12 +1775,6 @@ public:
         WriteLogF(L"java.exe  exists=%d", GetFileAttributesW(javaExe.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"gameDir   exists=%d", GetFileAttributesW(gameDir.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"clientJar exists=%d", GetFileAttributesW(clientJar.c_str()) != INVALID_FILE_ATTRIBUTES);
-
-        LaunchAuthConfig authConfig;
-        if (!ResolveLaunchAuthConfig(g_authWindow.Get(), authConfig)) {
-            WriteLog(L"Dynamic authentication failed");
-            return E_FAIL;
-        }
 
         std::vector<std::wstring> jars;
         CollectJars(classpathGameDir + L"\\libraries", jars);
