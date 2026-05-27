@@ -20,8 +20,23 @@
 #include <chrono>
 #include <thread>
 #include <fstream>
+#include <algorithm>
+#include <cctype>
+#include <d2d1_1.h>
+#include <dwrite.h>
+#include <d3d11_1.h>
+#include <dxgi1_3.h>
+#include <sstream>
+#include <iomanip>
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Security.Credentials.h>
+#include <winrt/Windows.Storage.Streams.h>
+#include <winrt/Windows.Web.Http.h>
+#include <winrt/Windows.Web.Http.Headers.h>
 
 #include "runtime_config.h"
+#include "qr_code.h"
 
 // ICoreWindowInterop is forward-declared without a GUID, so IID_PPV_ARGS
 // cannot use it directly. Redeclare it with the correct uuid here.
@@ -46,7 +61,12 @@ static bool g_setWindowCalled = false;
 static HRESULT g_windowInteropHr = E_NOTIMPL;
 static HRESULT g_getWindowHandleHr = E_NOTIMPL;
 static HWND g_windowHandle = NULL;
+static ComPtr<ICoreWindow> g_authWindow;
 static constexpr wchar_t kEGLNativeWindowTypeProperty[] = L"EGLNativeWindowTypeProperty";
+static constexpr char kMicrosoftAuthClientId[] = "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb";
+static constexpr char kMicrosoftAuthScopes[] = "XboxLive.signin offline_access";
+static constexpr wchar_t kRefreshTokenResource[] = L"MinecraftJavaUWP.MicrosoftRefreshToken";
+static constexpr wchar_t kRefreshTokenUser[] = L"default";
 
 typedef jint(JNICALL* JNI_CreateJavaVM_t)(JavaVM**, void**, void*);
 
@@ -325,9 +345,9 @@ static std::wstring GetEnvVarString(const wchar_t* name) {
 }
 
 struct LaunchAuthConfig {
-    std::string username = "DevPlayer";
-    std::string uuid = "00000000-0000-0000-0000-000000000000";
-    std::string accessToken = "0";
+    std::string username;
+    std::string uuid;
+    std::string accessToken;
 };
 
 static std::string ExtractJsonStringValue(const std::string& content, const char* key) {
@@ -361,30 +381,887 @@ static std::string ExtractJsonStringValue(const std::string& content, const char
     return {};
 }
 
-static LaunchAuthConfig LoadLaunchAuthConfig(const std::wstring& path) {
-    LaunchAuthConfig config;
-    std::ifstream file(path);
-    if (!file.good()) {
-        WriteLogF(L"Auth config not found at %s; using defaults", path.c_str());
-        return config;
+static int ExtractJsonIntValue(const std::string& content, const char* key, int fallback = 0) {
+    if (!key || !*key) return fallback;
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t keyPos = content.find(needle);
+    if (keyPos == std::string::npos) return fallback;
+
+    size_t pos = content.find(':', keyPos + needle.size());
+    if (pos == std::string::npos) return fallback;
+    ++pos;
+    while (pos < content.size() && isspace(static_cast<unsigned char>(content[pos]))) {
+        ++pos;
     }
 
-    const std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    if (content.empty()) {
-        WriteLogF(L"Auth config empty at %s; using defaults", path.c_str());
-        return config;
+    const size_t start = pos;
+    if (pos < content.size() && content[pos] == '-') {
+        ++pos;
+    }
+    while (pos < content.size() && isdigit(static_cast<unsigned char>(content[pos]))) {
+        ++pos;
+    }
+    if (pos == start) return fallback;
+
+    try {
+        return std::stoi(content.substr(start, pos - start));
+    } catch (...) {
+        return fallback;
+    }
+}
+
+static std::string JsonEscape(const std::string& value) {
+    std::string result;
+    result.reserve(value.size() + 8);
+    for (unsigned char c : value) {
+        switch (c) {
+        case '\\': result += "\\\\"; break;
+        case '"':  result += "\\\""; break;
+        case '\b': result += "\\b"; break;
+        case '\f': result += "\\f"; break;
+        case '\n': result += "\\n"; break;
+        case '\r': result += "\\r"; break;
+        case '\t': result += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                char buf[7] = {};
+                sprintf_s(buf, "\\u%04x", c);
+                result += buf;
+            } else {
+                result.push_back(static_cast<char>(c));
+            }
+            break;
+        }
+    }
+    return result;
+}
+
+static std::string FormUrlEncode(const std::string& value) {
+    std::ostringstream encoded;
+    encoded << std::uppercase << std::hex;
+    for (unsigned char c : value) {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            encoded << static_cast<char>(c);
+        } else if (c == ' ') {
+            encoded << '+';
+        } else {
+            encoded << '%' << std::setw(2) << std::setfill('0') << static_cast<int>(c);
+        }
+    }
+    return encoded.str();
+}
+
+static std::string MakeFormBody(std::initializer_list<std::pair<std::string, std::string>> fields) {
+    std::string body;
+    bool first = true;
+    for (const auto& field : fields) {
+        if (!first) body += '&';
+        first = false;
+        body += FormUrlEncode(field.first);
+        body += '=';
+        body += FormUrlEncode(field.second);
+    }
+    return body;
+}
+
+static std::string NormalizeMinecraftUuid(const std::string& value) {
+    std::string compact;
+    compact.reserve(value.size());
+    for (char c : value) {
+        if (c != '-') compact.push_back(c);
+    }
+    if (compact.size() != 32) {
+        return value;
+    }
+    return compact.substr(0, 8) + "-" +
+        compact.substr(8, 4) + "-" +
+        compact.substr(12, 4) + "-" +
+        compact.substr(16, 4) + "-" +
+        compact.substr(20, 12);
+}
+
+struct HttpResult {
+    int status = 0;
+    std::string body;
+
+    bool success() const {
+        return status >= 200 && status < 300;
+    }
+};
+
+static HttpResult HttpPostString(const wchar_t* url, const std::string& body, const wchar_t* mediaType) {
+    HttpResult result;
+    try {
+        using namespace winrt::Windows::Foundation;
+        using namespace winrt::Windows::Storage::Streams;
+        using namespace winrt::Windows::Web::Http;
+
+        HttpClient client;
+        HttpStringContent content(winrt::to_hstring(body), UnicodeEncoding::Utf8, mediaType);
+        HttpResponseMessage response = client.PostAsync(winrt::Windows::Foundation::Uri(url), content).get();
+        result.status = static_cast<int>(response.StatusCode());
+        result.body = winrt::to_string(response.Content().ReadAsStringAsync().get());
+    } catch (const winrt::hresult_error& ex) {
+        WriteLogF(L"HTTP POST failed url=%s hr=0x%08X msg=%s",
+            url, static_cast<unsigned int>(ex.code()), ex.message().c_str());
+    }
+    return result;
+}
+
+static HttpResult HttpGetBearer(const wchar_t* url, const std::string& token) {
+    HttpResult result;
+    try {
+        using namespace winrt::Windows::Foundation;
+        using namespace winrt::Windows::Web::Http;
+        using namespace winrt::Windows::Web::Http::Headers;
+
+        HttpClient client;
+        HttpRequestMessage request(HttpMethod::Get(), winrt::Windows::Foundation::Uri(url));
+        request.Headers().Authorization(HttpCredentialsHeaderValue(L"Bearer", winrt::to_hstring(token)));
+        HttpResponseMessage response = client.SendRequestAsync(request).get();
+        result.status = static_cast<int>(response.StatusCode());
+        result.body = winrt::to_string(response.Content().ReadAsStringAsync().get());
+    } catch (const winrt::hresult_error& ex) {
+        WriteLogF(L"HTTP GET failed url=%s hr=0x%08X msg=%s",
+            url, static_cast<unsigned int>(ex.code()), ex.message().c_str());
+    }
+    return result;
+}
+
+static bool SaveRefreshToken(const std::string& refreshToken) {
+    if (refreshToken.empty()) return false;
+    try {
+        winrt::Windows::Security::Credentials::PasswordVault vault;
+        try {
+            auto existing = vault.Retrieve(kRefreshTokenResource, kRefreshTokenUser);
+            vault.Remove(existing);
+        } catch (...) {
+        }
+        vault.Add(winrt::Windows::Security::Credentials::PasswordCredential(
+            kRefreshTokenResource,
+            kRefreshTokenUser,
+            winrt::to_hstring(refreshToken)));
+        WriteLog(L"Saved Microsoft refresh token to Credential Locker");
+        return true;
+    } catch (const winrt::hresult_error& ex) {
+        WriteLogF(L"Failed to save refresh token hr=0x%08X msg=%s",
+            static_cast<unsigned int>(ex.code()), ex.message().c_str());
+        return false;
+    }
+}
+
+static std::string LoadRefreshToken() {
+    try {
+        winrt::Windows::Security::Credentials::PasswordVault vault;
+        auto credential = vault.Retrieve(kRefreshTokenResource, kRefreshTokenUser);
+        credential.RetrievePassword();
+        return winrt::to_string(credential.Password());
+    } catch (...) {
+        return {};
+    }
+}
+
+static void ClearRefreshToken() {
+    try {
+        winrt::Windows::Security::Credentials::PasswordVault vault;
+        auto credential = vault.Retrieve(kRefreshTokenResource, kRefreshTokenUser);
+        vault.Remove(credential);
+    } catch (...) {
+    }
+}
+
+struct DeviceCodeResponse {
+    std::string userCode;
+    std::string deviceCode;
+    std::string verificationUri;
+    int expiresIn = 900;
+    int interval = 5;
+};
+
+struct MicrosoftTokenResponse {
+    std::string accessToken;
+    std::string refreshToken;
+    int expiresIn = 0;
+};
+
+struct XboxAuthResponse {
+    std::string token;
+    std::string userHash;
+};
+
+enum class DevicePollStatus {
+    Pending,
+    SlowDown,
+    Success,
+    Failed
+};
+
+struct DevicePollResult {
+    DevicePollStatus status = DevicePollStatus::Failed;
+    MicrosoftTokenResponse token;
+    std::string error;
+};
+
+struct AuthUiState {
+    std::wstring userCode;
+    std::wstring verificationUri;
+    std::wstring status;
+    std::wstring detail;
+    int secondsRemaining = 0;
+    bool isError = false;
+    QrMatrix qr;
+};
+
+class AuthScreenRenderer {
+public:
+    bool Initialize(ICoreWindow* window) {
+        if (!window) return false;
+        window_ = window;
+
+        Rect bounds = {};
+        if (FAILED(window->get_Bounds(&bounds))) {
+            bounds.Width = 1280;
+            bounds.Height = 720;
+        }
+        width_ = bounds.Width > 0 ? bounds.Width : 1280;
+        height_ = bounds.Height > 0 ? bounds.Height : 720;
+
+        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        D3D_FEATURE_LEVEL levels[] = {
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1,
+            D3D_FEATURE_LEVEL_10_0
+        };
+        D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+        HRESULT hr = D3D11CreateDevice(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            flags,
+            levels,
+            ARRAYSIZE(levels),
+            D3D11_SDK_VERSION,
+            d3dDevice_.GetAddressOf(),
+            &level,
+            d3dContext_.GetAddressOf());
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen D3D11CreateDevice failed hr=0x%08X", hr);
+            return false;
+        }
+
+        hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory_.GetAddressOf());
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen D2D factory failed hr=0x%08X", hr);
+            return false;
+        }
+
+        ComPtr<IDXGIDevice> dxgiDevice;
+        hr = d3dDevice_.As(&dxgiDevice);
+        if (FAILED(hr)) return false;
+
+        hr = d2dFactory_->CreateDevice(dxgiDevice.Get(), d2dDevice_.GetAddressOf());
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen D2D device failed hr=0x%08X", hr);
+            return false;
+        }
+
+        hr = d2dDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, d2dContext_.GetAddressOf());
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen D2D context failed hr=0x%08X", hr);
+            return false;
+        }
+
+        ComPtr<IDXGIAdapter> adapter;
+        hr = dxgiDevice->GetAdapter(adapter.GetAddressOf());
+        if (FAILED(hr)) return false;
+
+        ComPtr<IDXGIFactory2> dxgiFactory;
+        hr = adapter->GetParent(IID_PPV_ARGS(dxgiFactory.GetAddressOf()));
+        if (FAILED(hr)) return false;
+
+        DXGI_SWAP_CHAIN_DESC1 desc = {};
+        desc.Width = 0;
+        desc.Height = 0;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.Stereo = FALSE;
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.BufferCount = 2;
+        desc.Scaling = DXGI_SCALING_STRETCH;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+
+        hr = dxgiFactory->CreateSwapChainForCoreWindow(
+            d3dDevice_.Get(),
+            reinterpret_cast<IUnknown*>(window),
+            &desc,
+            nullptr,
+            swapChain_.GetAddressOf());
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen swap chain failed hr=0x%08X", hr);
+            return false;
+        }
+
+        ComPtr<IDXGISurface> backBuffer;
+        hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf()));
+        if (FAILED(hr)) return false;
+
+        D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+            96.0f,
+            96.0f);
+        hr = d2dContext_->CreateBitmapFromDxgiSurface(backBuffer.Get(), &props, targetBitmap_.GetAddressOf());
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen target bitmap failed hr=0x%08X", hr);
+            return false;
+        }
+        d2dContext_->SetTarget(targetBitmap_.Get());
+
+        hr = DWriteCreateFactory(
+            DWRITE_FACTORY_TYPE_SHARED,
+            __uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(dwriteFactory_.GetAddressOf()));
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen DWrite factory failed hr=0x%08X", hr);
+            return false;
+        }
+
+        CreateTextFormats();
+        return true;
     }
 
-    const std::string username = ExtractJsonStringValue(content, "username");
-    const std::string uuid = ExtractJsonStringValue(content, "uuid");
-    const std::string accessToken = ExtractJsonStringValue(content, "accessToken");
+    void Render(const AuthUiState& state) {
+        if (!d2dContext_ || !swapChain_) return;
 
-    if (!username.empty()) config.username = username;
-    if (!uuid.empty()) config.uuid = uuid;
-    if (!accessToken.empty()) config.accessToken = accessToken;
+        ComPtr<ID2D1SolidColorBrush> white;
+        ComPtr<ID2D1SolidColorBrush> muted;
+        ComPtr<ID2D1SolidColorBrush> panel;
+        ComPtr<ID2D1SolidColorBrush> accent;
+        ComPtr<ID2D1SolidColorBrush> danger;
+        ComPtr<ID2D1SolidColorBrush> black;
 
-    WriteLogF(L"Loaded auth config from %s", path.c_str());
-    return config;
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0xF5F7F8), white.GetAddressOf());
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0xA9B0B4), muted.GetAddressOf());
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x151718), panel.GetAddressOf());
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x70C486), accent.GetAddressOf());
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0xE36A5C), danger.GetAddressOf());
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x000000), black.GetAddressOf());
+
+        d2dContext_->BeginDraw();
+        d2dContext_->Clear(D2D1::ColorF(0x070808));
+
+        const float marginX = width_ * 0.075f;
+        const float marginY = height_ * 0.11f;
+        const D2D1_RECT_F frame = D2D1::RectF(marginX, marginY, width_ - marginX, height_ - marginY);
+        d2dContext_->DrawRectangle(frame, white.Get(), 3.0f);
+
+        const float dividerX = frame.left + (frame.right - frame.left) * 0.52f;
+        d2dContext_->DrawLine(
+            D2D1::Point2F(dividerX, frame.top + 32.0f),
+            D2D1::Point2F(dividerX, frame.bottom - 32.0f),
+            white.Get(),
+            3.0f);
+
+        const D2D1_RECT_F titleRect = D2D1::RectF(frame.left + 42.0f, frame.top + 34.0f, dividerX - 42.0f, frame.top + 86.0f);
+        DrawText(L"Microsoft sign-in", bodyFormat_.Get(), titleRect, white.Get());
+
+        const D2D1_RECT_F codeBox = D2D1::RectF(frame.left + 42.0f, frame.top + 102.0f, dividerX - 42.0f, frame.top + 190.0f);
+        d2dContext_->DrawRectangle(codeBox, white.Get(), 2.0f);
+        if (!state.userCode.empty()) {
+            DrawText(state.userCode.c_str(), codeFormat_.Get(), codeBox, white.Get());
+        }
+
+        std::wstring instruction = L"Enter this code at";
+        std::wstring url = state.verificationUri.empty() ? L"microsoft.com/link" : state.verificationUri;
+        const D2D1_RECT_F bodyRect = D2D1::RectF(frame.left + 46.0f, frame.top + 218.0f, dividerX - 48.0f, frame.top + 326.0f);
+        DrawText((instruction + L"\n" + url).c_str(), bodyFormat_.Get(), bodyRect, white.Get());
+
+        std::wstring status = state.status;
+        if (state.secondsRemaining > 0) {
+            status += L"\nCode expires in " + std::to_wstring(state.secondsRemaining) + L" seconds";
+        }
+        const D2D1_RECT_F statusRect = D2D1::RectF(frame.left + 46.0f, frame.bottom - 116.0f, dividerX - 48.0f, frame.bottom - 38.0f);
+        DrawText(status.c_str(), smallFormat_.Get(), statusRect, state.isError ? danger.Get() : muted.Get());
+
+        if (!state.detail.empty()) {
+            const D2D1_RECT_F detailRect = D2D1::RectF(frame.left + 46.0f, frame.bottom - 160.0f, dividerX - 48.0f, frame.bottom - 118.0f);
+            DrawText(state.detail.c_str(), smallFormat_.Get(), detailRect, muted.Get());
+        }
+
+        const float qrSide = (std::min)((frame.right - dividerX) * 0.55f, (frame.bottom - frame.top) * 0.58f);
+        const float qrLeft = dividerX + ((frame.right - dividerX) - qrSide) * 0.5f;
+        const float qrTop = frame.top + ((frame.bottom - frame.top) - qrSide) * 0.43f;
+        const D2D1_RECT_F qrRect = D2D1::RectF(qrLeft, qrTop, qrLeft + qrSide, qrTop + qrSide);
+        DrawQr(state.qr, qrRect, white.Get(), black.Get(), muted.Get());
+
+        const D2D1_RECT_F qrLabel = D2D1::RectF(qrLeft, qrRect.bottom + 18.0f, qrLeft + qrSide, qrRect.bottom + 54.0f);
+        DrawText(L"Scan QR", smallFormat_.Get(), qrLabel, muted.Get());
+
+        HRESULT hr = d2dContext_->EndDraw();
+        if (FAILED(hr)) {
+            WriteLogF(L"Auth screen EndDraw failed hr=0x%08X", hr);
+        }
+        swapChain_->Present(1, 0);
+    }
+
+private:
+    ComPtr<ICoreWindow> window_;
+    ComPtr<ID3D11Device> d3dDevice_;
+    ComPtr<ID3D11DeviceContext> d3dContext_;
+    ComPtr<IDXGISwapChain1> swapChain_;
+    ComPtr<ID2D1Factory1> d2dFactory_;
+    ComPtr<ID2D1Device> d2dDevice_;
+    ComPtr<ID2D1DeviceContext> d2dContext_;
+    ComPtr<ID2D1Bitmap1> targetBitmap_;
+    ComPtr<IDWriteFactory> dwriteFactory_;
+    ComPtr<IDWriteTextFormat> codeFormat_;
+    ComPtr<IDWriteTextFormat> bodyFormat_;
+    ComPtr<IDWriteTextFormat> smallFormat_;
+    float width_ = 1280.0f;
+    float height_ = 720.0f;
+
+    void CreateTextFormats() {
+        if (!dwriteFactory_) return;
+        dwriteFactory_->CreateTextFormat(
+            L"Consolas", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 48.0f, L"en-US", codeFormat_.GetAddressOf());
+        dwriteFactory_->CreateTextFormat(
+            L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 30.0f, L"en-US", bodyFormat_.GetAddressOf());
+        dwriteFactory_->CreateTextFormat(
+            L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 21.0f, L"en-US", smallFormat_.GetAddressOf());
+
+        if (codeFormat_) {
+            codeFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            codeFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+        if (bodyFormat_) {
+            bodyFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            bodyFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        }
+        if (smallFormat_) {
+            smallFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            smallFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        }
+    }
+
+    void DrawText(const wchar_t* text, IDWriteTextFormat* format, D2D1_RECT_F rect, ID2D1Brush* brush) {
+        if (!text || !format || !brush) return;
+        d2dContext_->DrawText(
+            text,
+            static_cast<UINT32>(wcslen(text)),
+            format,
+            rect,
+            brush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    void DrawQr(const QrMatrix& qr, D2D1_RECT_F rect, ID2D1Brush* white, ID2D1Brush* black, ID2D1Brush* muted) {
+        d2dContext_->FillRectangle(rect, white);
+        if (qr.empty()) {
+            DrawText(L"QR", codeFormat_.Get(), rect, muted);
+            return;
+        }
+
+        constexpr int quiet = 4;
+        const float module = (std::min)(
+            (rect.right - rect.left) / static_cast<float>(qr.size + quiet * 2),
+            (rect.bottom - rect.top) / static_cast<float>(qr.size + quiet * 2));
+        const float qrDraw = module * static_cast<float>(qr.size + quiet * 2);
+        const float startX = rect.left + ((rect.right - rect.left) - qrDraw) * 0.5f + module * quiet;
+        const float startY = rect.top + ((rect.bottom - rect.top) - qrDraw) * 0.5f + module * quiet;
+
+        for (int y = 0; y < qr.size; ++y) {
+            for (int x = 0; x < qr.size; ++x) {
+                if (!qr.at(x, y)) continue;
+                const D2D1_RECT_F moduleRect = D2D1::RectF(
+                    startX + x * module,
+                    startY + y * module,
+                    startX + (x + 1) * module + 0.25f,
+                    startY + (y + 1) * module + 0.25f);
+                d2dContext_->FillRectangle(moduleRect, black);
+            }
+        }
+    }
+};
+
+static void ProcessAuthUiEvents() {
+    if (!g_authWindow) return;
+
+    ComPtr<ICoreDispatcher> dispatcher;
+    if (FAILED(g_authWindow->get_Dispatcher(dispatcher.GetAddressOf())) || !dispatcher) {
+        return;
+    }
+    dispatcher->ProcessEvents(CoreProcessEventsOption_ProcessAllIfPresent);
+}
+
+static void RenderAuth(AuthScreenRenderer* renderer, const AuthUiState& state) {
+    ProcessAuthUiEvents();
+    if (renderer) {
+        renderer->Render(state);
+    }
+}
+
+static void SleepWithAuthUi(AuthScreenRenderer* renderer, AuthUiState& state, int milliseconds) {
+    const auto start = std::chrono::steady_clock::now();
+    while (true) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= milliseconds) break;
+
+        RenderAuth(renderer, state);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+static bool RequestDeviceCode(DeviceCodeResponse& out, std::string& error) {
+    const std::string body = MakeFormBody({
+        { "client_id", kMicrosoftAuthClientId },
+        { "scope", kMicrosoftAuthScopes }
+    });
+    const HttpResult response = HttpPostString(
+        L"https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode",
+        body,
+        L"application/x-www-form-urlencoded");
+    if (!response.success()) {
+        error = "Device code request failed: HTTP " + std::to_string(response.status) + " " + response.body;
+        return false;
+    }
+
+    out.userCode = ExtractJsonStringValue(response.body, "user_code");
+    out.deviceCode = ExtractJsonStringValue(response.body, "device_code");
+    out.verificationUri = ExtractJsonStringValue(response.body, "verification_uri");
+    out.expiresIn = ExtractJsonIntValue(response.body, "expires_in", 900);
+    out.interval = (std::max)(1, ExtractJsonIntValue(response.body, "interval", 5));
+
+    if (out.userCode.empty() || out.deviceCode.empty() || out.verificationUri.empty()) {
+        error = "Device code response was missing required fields.";
+        return false;
+    }
+
+    WriteLogF(L"Device auth code received user_code=%s expires=%d interval=%d",
+        a2w(out.userCode.c_str()).c_str(), out.expiresIn, out.interval);
+    return true;
+}
+
+static DevicePollResult PollDeviceToken(const std::string& deviceCode) {
+    DevicePollResult result;
+    const std::string body = MakeFormBody({
+        { "grant_type", "urn:ietf:params:oauth:grant-type:device_code" },
+        { "client_id", kMicrosoftAuthClientId },
+        { "device_code", deviceCode }
+    });
+    const HttpResult response = HttpPostString(
+        L"https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+        body,
+        L"application/x-www-form-urlencoded");
+
+    if (response.success()) {
+        result.status = DevicePollStatus::Success;
+        result.token.accessToken = ExtractJsonStringValue(response.body, "access_token");
+        result.token.refreshToken = ExtractJsonStringValue(response.body, "refresh_token");
+        result.token.expiresIn = ExtractJsonIntValue(response.body, "expires_in", 0);
+        if (result.token.accessToken.empty()) {
+            result.status = DevicePollStatus::Failed;
+            result.error = "Microsoft token response did not include access_token.";
+        }
+        return result;
+    }
+
+    const std::string code = ExtractJsonStringValue(response.body, "error");
+    if (code == "authorization_pending") {
+        result.status = DevicePollStatus::Pending;
+    } else if (code == "slow_down") {
+        result.status = DevicePollStatus::SlowDown;
+    } else {
+        result.status = DevicePollStatus::Failed;
+        result.error = code.empty()
+            ? "Microsoft token polling failed: HTTP " + std::to_string(response.status)
+            : code + ": " + ExtractJsonStringValue(response.body, "error_description");
+    }
+    return result;
+}
+
+static bool RefreshMicrosoftToken(const std::string& refreshToken, MicrosoftTokenResponse& out, std::string& error) {
+    const std::string body = MakeFormBody({
+        { "grant_type", "refresh_token" },
+        { "client_id", kMicrosoftAuthClientId },
+        { "refresh_token", refreshToken },
+        { "scope", kMicrosoftAuthScopes }
+    });
+    const HttpResult response = HttpPostString(
+        L"https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+        body,
+        L"application/x-www-form-urlencoded");
+    if (!response.success()) {
+        error = "Saved Microsoft session expired.";
+        return false;
+    }
+
+    out.accessToken = ExtractJsonStringValue(response.body, "access_token");
+    out.refreshToken = ExtractJsonStringValue(response.body, "refresh_token");
+    out.expiresIn = ExtractJsonIntValue(response.body, "expires_in", 0);
+    if (out.accessToken.empty()) {
+        error = "Microsoft refresh response did not include access_token.";
+        return false;
+    }
+    return true;
+}
+
+static bool AuthenticateWithXboxLive(const std::string& microsoftAccessToken, XboxAuthResponse& out, std::string& error) {
+    const std::string payload =
+        "{\"Properties\":{\"AuthMethod\":\"RPS\",\"SiteName\":\"user.auth.xboxlive.com\",\"RpsTicket\":\"d=" +
+        JsonEscape(microsoftAccessToken) +
+        "\"},\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\"}";
+    const HttpResult response = HttpPostString(
+        L"https://user.auth.xboxlive.com/user/authenticate",
+        payload,
+        L"application/json");
+    if (!response.success()) {
+        error = "Xbox Live auth failed: HTTP " + std::to_string(response.status) + " " + response.body;
+        return false;
+    }
+
+    out.token = ExtractJsonStringValue(response.body, "Token");
+    out.userHash = ExtractJsonStringValue(response.body, "uhs");
+    if (out.token.empty() || out.userHash.empty()) {
+        error = "Xbox Live auth response was missing token fields.";
+        return false;
+    }
+    return true;
+}
+
+static bool AuthorizeWithXsts(const std::string& xboxToken, const char* relyingParty, XboxAuthResponse& out, std::string& error) {
+    const std::string payload =
+        "{\"Properties\":{\"SandboxId\":\"RETAIL\",\"UserTokens\":[\"" +
+        JsonEscape(xboxToken) +
+        "\"]},\"RelyingParty\":\"" +
+        JsonEscape(relyingParty) +
+        "\",\"TokenType\":\"JWT\"}";
+    const HttpResult response = HttpPostString(
+        L"https://xsts.auth.xboxlive.com/xsts/authorize",
+        payload,
+        L"application/json");
+    if (!response.success()) {
+        error = "XSTS auth failed: HTTP " + std::to_string(response.status) + " " + response.body;
+        return false;
+    }
+
+    out.token = ExtractJsonStringValue(response.body, "Token");
+    out.userHash = ExtractJsonStringValue(response.body, "uhs");
+    if (out.token.empty() || out.userHash.empty()) {
+        error = "XSTS response was missing token fields.";
+        return false;
+    }
+    return true;
+}
+
+static bool LoginToMinecraft(const std::string& userHash, const std::string& xstsToken, MicrosoftTokenResponse& out, std::string& error) {
+    const std::string identity = "XBL3.0 x=" + userHash + ";" + xstsToken;
+    const std::string payload = "{\"identityToken\":\"" + JsonEscape(identity) + "\"}";
+    const HttpResult response = HttpPostString(
+        L"https://api.minecraftservices.com/authentication/login_with_xbox",
+        payload,
+        L"application/json");
+    if (!response.success()) {
+        error = "Minecraft login failed: HTTP " + std::to_string(response.status) + " " + response.body;
+        return false;
+    }
+
+    out.accessToken = ExtractJsonStringValue(response.body, "access_token");
+    out.expiresIn = ExtractJsonIntValue(response.body, "expires_in", 0);
+    if (out.accessToken.empty()) {
+        error = "Minecraft login response did not include access_token.";
+        return false;
+    }
+    return true;
+}
+
+static bool EnsureMinecraftEntitlement(const std::string& minecraftAccessToken, std::string& error) {
+    const HttpResult response = HttpGetBearer(
+        L"https://api.minecraftservices.com/entitlements/mcstore",
+        minecraftAccessToken);
+    if (!response.success()) {
+        error = "Minecraft entitlement check failed: HTTP " + std::to_string(response.status) + " " + response.body;
+        return false;
+    }
+
+    if (response.body.find("\"game_minecraft\"") == std::string::npos &&
+        response.body.find("\"product_minecraft\"") == std::string::npos) {
+        error = "This Microsoft account does not appear to own Minecraft Java Edition.";
+        return false;
+    }
+    return true;
+}
+
+static bool FetchMinecraftProfile(const std::string& minecraftAccessToken, LaunchAuthConfig& out, std::string& error) {
+    const HttpResult response = HttpGetBearer(
+        L"https://api.minecraftservices.com/minecraft/profile",
+        minecraftAccessToken);
+    if (!response.success()) {
+        error = "Minecraft profile request failed: HTTP " + std::to_string(response.status) + " " + response.body;
+        return false;
+    }
+
+    out.uuid = NormalizeMinecraftUuid(ExtractJsonStringValue(response.body, "id"));
+    out.username = ExtractJsonStringValue(response.body, "name");
+    out.accessToken = minecraftAccessToken;
+    if (out.uuid.empty() || out.username.empty()) {
+        error = "Minecraft profile response was missing id or name.";
+        return false;
+    }
+    return true;
+}
+
+static bool BuildMinecraftAuth(const std::string& microsoftAccessToken, LaunchAuthConfig& out, std::string& error) {
+    XboxAuthResponse xbl;
+    if (!AuthenticateWithXboxLive(microsoftAccessToken, xbl, error)) {
+        return false;
+    }
+
+    XboxAuthResponse xsts;
+    if (!AuthorizeWithXsts(xbl.token, "rp://api.minecraftservices.com/", xsts, error)) {
+        return false;
+    }
+
+    MicrosoftTokenResponse minecraftToken;
+    if (!LoginToMinecraft(xsts.userHash, xsts.token, minecraftToken, error)) {
+        return false;
+    }
+
+    if (!EnsureMinecraftEntitlement(minecraftToken.accessToken, error)) {
+        return false;
+    }
+
+    if (!FetchMinecraftProfile(minecraftToken.accessToken, out, error)) {
+        return false;
+    }
+
+    WriteLogF(L"Minecraft auth resolved username=%s uuid=%s",
+        a2w(out.username.c_str()).c_str(),
+        a2w(out.uuid.c_str()).c_str());
+    return true;
+}
+
+static bool ResolveLaunchAuthConfig(ICoreWindow* window, LaunchAuthConfig& out) {
+    AuthScreenRenderer rendererInstance;
+    AuthScreenRenderer* renderer = nullptr;
+    if (rendererInstance.Initialize(window)) {
+        renderer = &rendererInstance;
+    }
+
+    AuthUiState state;
+    state.verificationUri = L"microsoft.com/link";
+    state.status = L"Checking saved Microsoft session";
+    RenderAuth(renderer, state);
+
+    const std::string savedRefreshToken = LoadRefreshToken();
+    if (!savedRefreshToken.empty()) {
+        MicrosoftTokenResponse refreshed;
+        std::string error;
+        if (RefreshMicrosoftToken(savedRefreshToken, refreshed, error)) {
+            if (!refreshed.refreshToken.empty()) {
+                SaveRefreshToken(refreshed.refreshToken);
+            }
+            state.status = L"Verifying Minecraft ownership";
+            RenderAuth(renderer, state);
+            if (BuildMinecraftAuth(refreshed.accessToken, out, error)) {
+                state.status = L"Signed in as " + a2w(out.username.c_str());
+                RenderAuth(renderer, state);
+                SleepWithAuthUi(renderer, state, 700);
+                return true;
+            }
+        }
+
+        WriteLogF(L"Saved auth failed: %s", a2w(error.c_str()).c_str());
+        ClearRefreshToken();
+    }
+
+    DeviceCodeResponse device;
+    std::string error;
+    if (!RequestDeviceCode(device, error)) {
+        state.status = L"Microsoft sign-in failed";
+        state.detail = a2w(error.c_str());
+        state.isError = true;
+        RenderAuth(renderer, state);
+        SleepWithAuthUi(renderer, state, 5000);
+        return false;
+    }
+
+    state.userCode = a2w(device.userCode.c_str());
+    state.verificationUri = a2w(device.verificationUri.c_str());
+    state.qr = GenerateLoginQrMatrix("https://www.microsoft.com/link?otc=" + device.userCode);
+    state.status = L"Waiting for Microsoft sign-in";
+    state.detail = L"Use the account that owns Minecraft Java Edition.";
+    state.secondsRemaining = device.expiresIn;
+    RenderAuth(renderer, state);
+
+    auto expiresAt = std::chrono::steady_clock::now() + std::chrono::seconds(device.expiresIn);
+    int interval = device.interval;
+    while (std::chrono::steady_clock::now() < expiresAt) {
+        state.secondsRemaining = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::seconds>(expiresAt - std::chrono::steady_clock::now()).count());
+        state.status = L"Waiting for Microsoft sign-in";
+        state.detail = L"Use the account that owns Minecraft Java Edition.";
+        SleepWithAuthUi(renderer, state, interval * 1000);
+
+        state.status = L"Checking sign-in";
+        state.detail.clear();
+        RenderAuth(renderer, state);
+
+        DevicePollResult poll = PollDeviceToken(device.deviceCode);
+        if (poll.status == DevicePollStatus::Pending) {
+            continue;
+        }
+        if (poll.status == DevicePollStatus::SlowDown) {
+            interval += 5;
+            continue;
+        }
+        if (poll.status == DevicePollStatus::Failed) {
+            state.status = L"Microsoft sign-in failed";
+            state.detail = a2w(poll.error.c_str());
+            state.isError = true;
+            RenderAuth(renderer, state);
+            SleepWithAuthUi(renderer, state, 7000);
+            return false;
+        }
+
+        if (!poll.token.refreshToken.empty()) {
+            SaveRefreshToken(poll.token.refreshToken);
+        }
+
+        state.status = L"Verifying Minecraft ownership";
+        state.detail.clear();
+        RenderAuth(renderer, state);
+
+        if (BuildMinecraftAuth(poll.token.accessToken, out, error)) {
+            state.status = L"Signed in as " + a2w(out.username.c_str());
+            state.secondsRemaining = 0;
+            state.detail.clear();
+            RenderAuth(renderer, state);
+            SleepWithAuthUi(renderer, state, 900);
+            return true;
+        }
+
+        state.status = L"Minecraft sign-in failed";
+        state.detail = a2w(error.c_str());
+        state.isError = true;
+        RenderAuth(renderer, state);
+        SleepWithAuthUi(renderer, state, 8000);
+        return false;
+    }
+
+    state.status = L"Microsoft sign-in expired";
+    state.detail = L"Restart the app to request a new code.";
+    state.isError = true;
+    state.secondsRemaining = 0;
+    RenderAuth(renderer, state);
+    SleepWithAuthUi(renderer, state, 5000);
+    return false;
 }
 
 static bool RedirectStdStreams(const std::wstring& path) {
@@ -574,13 +1451,13 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::wstring& clientJar,
     const std::wstring& javaLog,
     const std::wstring& argsPath,
-    const std::wstring& classPath)
+    const std::wstring& classPath,
+    const LaunchAuthConfig& authConfig)
 {
     const std::wstring jnaTmpDir = nativesDir;
     const std::wstring lwjglTmpDir = exeDir;
     const std::wstring logConfigPath = gameDir + L"\\log_configs\\client-uwp.xml";
     const std::wstring fabricLogPath = gameDir + L"\\logs\\fabric-loader.log";
-    const LaunchAuthConfig authConfig = LoadLaunchAuthConfig(exeDir + L"\\launch_auth.json");
 
     EnsureDirectoryTree(gameDir + L"\\logs");
     EnsureDirectoryTree(gameDir + L"\\crash-reports");
@@ -752,6 +1629,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE SetWindow(ICoreWindow* window) override {
         g_setWindowCalled = true;
+        g_authWindow = window;
         if (g_logDir.empty()) {
             g_logDir = GetExecutableDir();
         }
@@ -891,6 +1769,12 @@ public:
         WriteLogF(L"gameDir   exists=%d", GetFileAttributesW(gameDir.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"clientJar exists=%d", GetFileAttributesW(clientJar.c_str()) != INVALID_FILE_ATTRIBUTES);
 
+        LaunchAuthConfig authConfig;
+        if (!ResolveLaunchAuthConfig(g_authWindow.Get(), authConfig)) {
+            WriteLog(L"Dynamic authentication failed");
+            return E_FAIL;
+        }
+
         std::vector<std::wstring> jars;
         CollectJars(classpathGameDir + L"\\libraries", jars);
         jars.push_back(clientJar);
@@ -902,7 +1786,7 @@ public:
             cp += fwd(jars[i]);
         }
         WriteLog(L"Launching embedded JVM");
-        if (!RunEmbeddedMinecraft(exeDir, jreDir, gameDir, assetsDir, nativesDir, bundledModsDir, userModsDir, clientJar, javaLog, argsPath, cp)) {
+        if (!RunEmbeddedMinecraft(exeDir, jreDir, gameDir, assetsDir, nativesDir, bundledModsDir, userModsDir, clientJar, javaLog, argsPath, cp, authConfig)) {
             WriteLog(L"Embedded JVM launch failed");
             return E_FAIL;
         }

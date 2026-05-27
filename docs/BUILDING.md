@@ -117,21 +117,19 @@ lwjgl_stb.dll
 OpenAL.dll
 ```
 
-## Obtain your account credentials
+## Microsoft sign-in
 
-**THIS WILL ONLY BE NECESSARY UNTIL WE IMPLEMENT PROPER AUTHENTICATION.**
+The packaged app signs in dynamically. You no longer need to create or bundle a
+local auth JSON file.
 
-- Go to https://kqzz.github.io/mc-bearer-token/ and follow the instructions listed on there to obtain your accessToken
-- Go to https://mcuuid.net/ to obtain your account UUID
-- copy launch_auth.example.json and rename to launch_auth.json, then input the details below in this format.
+On first launch, the app shows a Microsoft device-code screen before Minecraft
+starts. Go to `https://www.microsoft.com/link`, enter the displayed code, and
+sign in with the Microsoft account that owns Minecraft Java Edition. The QR code
+on that screen opens the same Microsoft link flow.
 
-
-```cpp
-# replace these with your credentials
-"--username", "DevPlayer",                              # replace with your username
-"--uuid", "00000000-0000-0000-0000-000000000000",       # replace with your account uuid
-"--accessToken", "0",                                   # replace with your bearer token
-```
+After sign-in, the app exchanges the Microsoft token through Xbox Live, XSTS,
+and Minecraft Services, checks Java Edition ownership, and passes the resolved
+Minecraft username, UUID, and access token into the embedded JVM.
 
 ## Generate Fabric remapped jars
 
