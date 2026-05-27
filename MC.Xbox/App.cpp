@@ -22,6 +22,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <d2d1_1.h>
 #include <dwrite.h>
 #include <d3d11_1.h>
@@ -170,6 +171,8 @@ static std::wstring GetParentDir(const std::wstring& path) {
     return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
 }
 
+using RuntimeSeedProgressCallback = std::function<void(const wchar_t*, const wchar_t*, float)>;
+
 static void CopyFileIfNeeded(const std::wstring& src, const std::wstring& dst) {
     if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES) return;
 
@@ -208,7 +211,10 @@ static void CopyDirectoryContentsIfNeeded(const std::wstring& src, const std::ws
     FindClose(h);
 }
 
-static bool SeedLocalRuntime(const std::wstring& packageDir, const std::wstring& localDir) {
+static bool SeedLocalRuntime(
+    const std::wstring& packageDir,
+    const std::wstring& localDir,
+    const RuntimeSeedProgressCallback& progress = RuntimeSeedProgressCallback()) {
     if (packageDir.empty() || localDir.empty()) return false;
 
     EnsureDirectoryTree(localDir);
@@ -219,10 +225,25 @@ static bool SeedLocalRuntime(const std::wstring& packageDir, const std::wstring&
         GetFileAttributesW(runtimeDir.c_str()) != INVALID_FILE_ATTRIBUTES ? runtimeDir : legacyGameDir;
     WriteLogF(L"Game seed source: %s", gameSeedDir.c_str());
 
+    if (progress) {
+        progress(L"Copying game runtime", L"Preparing Java libraries and Minecraft files", 0.12f);
+    }
     CopyDirectoryContentsIfNeeded(gameSeedDir, localDir + L"\\game");
+    if (progress) {
+        progress(L"Copying assets", L"Preparing Minecraft assets", 0.52f);
+    }
     CopyDirectoryContentsIfNeeded(packageDir + L"\\assets", localDir + L"\\assets");
+    if (progress) {
+        progress(L"Copying native libraries", L"Preparing graphics and input runtime", 0.84f);
+    }
     CopyDirectoryContentsIfNeeded(packageDir + L"\\natives", localDir + L"\\natives");
+    if (progress) {
+        progress(L"Finalizing runtime", L"Writing launch configuration", 0.96f);
+    }
     CopyFileIfNeeded(packageDir + L"\\xbox_security.properties", localDir + L"\\xbox_security.properties");
+    if (progress) {
+        progress(L"Runtime ready", L"Starting Minecraft", 1.0f);
+    }
     WriteLog(L"LocalState runtime seed complete");
     return true;
 }
@@ -603,12 +624,15 @@ struct DevicePollResult {
 };
 
 struct AuthUiState {
+    std::wstring title;
     std::wstring userCode;
     std::wstring verificationUri;
     std::wstring status;
     std::wstring detail;
     int secondsRemaining = 0;
     bool isError = false;
+    bool showDeviceCode = true;
+    float progress = -1.0f;
     QrMatrix qr;
 };
 
@@ -789,6 +813,52 @@ public:
         const D2D1_RECT_F frame = D2D1::RectF(marginX, marginY, width_ - marginX, height_ - marginY);
         d2dContext_->DrawRectangle(frame, white.Get(), 3.0f);
 
+        auto finishDraw = [&]() {
+            HRESULT hr = d2dContext_->EndDraw();
+            if (FAILED(hr)) {
+                WriteLogF(L"Auth screen EndDraw failed hr=0x%08X", hr);
+            }
+            hr = swapChain_->Present(1, 0);
+            if (FAILED(hr)) {
+                WriteLogF(L"Auth screen Present failed hr=0x%08X", hr);
+            }
+            ProcessAuthUiEvents();
+        };
+
+        const std::wstring title = state.title.empty() ? L"Microsoft sign-in" : state.title;
+        if (!state.showDeviceCode) {
+            const float left = frame.left + 54.0f;
+            const float right = frame.right - 54.0f;
+            const D2D1_RECT_F titleRect = D2D1::RectF(left, frame.top + 72.0f, right, frame.top + 130.0f);
+            DrawText(title.c_str(), bodyFormat_.Get(), titleRect, white.Get());
+
+            const D2D1_RECT_F statusRect = D2D1::RectF(left, frame.top + 178.0f, right, frame.top + 240.0f);
+            DrawText(state.status.c_str(), bodyFormat_.Get(), statusRect, state.isError ? danger.Get() : white.Get());
+
+            if (!state.detail.empty()) {
+                const D2D1_RECT_F detailRect = D2D1::RectF(left, frame.top + 248.0f, right, frame.top + 306.0f);
+                DrawText(state.detail.c_str(), smallFormat_.Get(), detailRect, muted.Get());
+            }
+
+            if (state.progress >= 0.0f) {
+                const float progress = (std::max)(0.0f, (std::min)(1.0f, state.progress));
+                const float barTop = frame.bottom - 130.0f;
+                const float barHeight = 18.0f;
+                const D2D1_RECT_F track = D2D1::RectF(left, barTop, right, barTop + barHeight);
+                const D2D1_RECT_F fill = D2D1::RectF(left, barTop, left + (right - left) * progress, barTop + barHeight);
+                d2dContext_->FillRectangle(track, panel.Get());
+                d2dContext_->FillRectangle(fill, state.isError ? danger.Get() : accent.Get());
+
+                wchar_t percent[32] = {};
+                swprintf_s(percent, L"%d%%", static_cast<int>(progress * 100.0f + 0.5f));
+                const D2D1_RECT_F percentRect = D2D1::RectF(left, barTop + 28.0f, left + 140.0f, barTop + 68.0f);
+                DrawText(percent, smallFormat_.Get(), percentRect, muted.Get());
+            }
+
+            finishDraw();
+            return;
+        }
+
         const float dividerX = frame.left + (frame.right - frame.left) * 0.52f;
         d2dContext_->DrawLine(
             D2D1::Point2F(dividerX, frame.top + 32.0f),
@@ -797,7 +867,7 @@ public:
             3.0f);
 
         const D2D1_RECT_F titleRect = D2D1::RectF(frame.left + 42.0f, frame.top + 34.0f, dividerX - 42.0f, frame.top + 86.0f);
-        DrawText(L"Microsoft sign-in", bodyFormat_.Get(), titleRect, white.Get());
+        DrawText(title.c_str(), bodyFormat_.Get(), titleRect, white.Get());
 
         const D2D1_RECT_F codeBox = D2D1::RectF(frame.left + 42.0f, frame.top + 102.0f, dividerX - 42.0f, frame.top + 190.0f);
         d2dContext_->DrawRectangle(codeBox, white.Get(), 2.0f);
@@ -831,15 +901,7 @@ public:
         const D2D1_RECT_F qrLabel = D2D1::RectF(qrLeft, qrRect.bottom + 18.0f, qrLeft + qrSide, qrRect.bottom + 54.0f);
         DrawText(L"Scan QR", smallFormat_.Get(), qrLabel, muted.Get());
 
-        HRESULT hr = d2dContext_->EndDraw();
-        if (FAILED(hr)) {
-            WriteLogF(L"Auth screen EndDraw failed hr=0x%08X", hr);
-        }
-        hr = swapChain_->Present(1, 0);
-        if (FAILED(hr)) {
-            WriteLogF(L"Auth screen Present failed hr=0x%08X", hr);
-        }
-        ProcessAuthUiEvents();
+        finishDraw();
     }
 
 private:
@@ -973,6 +1035,22 @@ static void SleepWithAuthUi(AuthScreenRenderer* renderer, AuthUiState& state, in
         RenderAuth(renderer, state);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+}
+
+static void RenderPreparationProgress(
+    AuthScreenRenderer* renderer,
+    AuthUiState& state,
+    const wchar_t* status,
+    const wchar_t* detail,
+    float progress) {
+    state.title = L"Preparing Minecraft";
+    state.showDeviceCode = false;
+    state.status = status ? status : L"Preparing runtime";
+    state.detail = detail ? detail : L"";
+    state.progress = progress;
+    state.secondsRemaining = 0;
+    state.isError = false;
+    RenderAuth(renderer, state);
 }
 
 static bool RequestDeviceCode(DeviceCodeResponse& out, std::string& error) {
@@ -1797,7 +1875,26 @@ public:
         }
 
         if (exeDir != packageDir) {
-            SeedLocalRuntime(packageDir, exeDir);
+            AuthScreenRenderer prepRendererInstance;
+            AuthScreenRenderer* prepRenderer = nullptr;
+            if (prepRendererInstance.Initialize(g_authWindow.Get())) {
+                prepRenderer = &prepRendererInstance;
+            }
+
+            AuthUiState prepState;
+            RenderPreparationProgress(
+                prepRenderer,
+                prepState,
+                L"Preparing local runtime",
+                L"Copying packaged files into writable app storage",
+                0.04f);
+
+            SeedLocalRuntime(packageDir, exeDir,
+                [&](const wchar_t* status, const wchar_t* detail, float progress) {
+                    RenderPreparationProgress(prepRenderer, prepState, status, detail, progress);
+                });
+
+            SleepWithAuthUi(prepRenderer, prepState, 350);
         }
 
         // Keep java.home under the installed package. Java security startup calls
