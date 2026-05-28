@@ -428,6 +428,7 @@ Write-Host "Copying JRE..."
 Write-Host "JRE source: $jreSrc"
 Copy-Item -Recurse $jreSrc (Join-Path $pkg "jre")
 $xboxSecurityProperties = Join-Path $root "xbox_security.properties"
+Copy-Item $xboxSecurityProperties (Join-Path $pkg "xbox_security.properties") -Force
 Copy-Item $xboxSecurityProperties (Join-Path $pkg "jre\conf\security\xbox.properties") -Force
 Copy-Item $xboxSecurityProperties (Join-Path $pkg "jre\conf\security\java.security") -Force
 
