@@ -1162,7 +1162,7 @@ private:
 
         const std::wstring dir = GetExecutableDir() + L"\\Assets\\panorama";
         int loaded = 0;
-        for (int i = 0; i < 6; ++i) {
+        for (int i = 0; i < 4; ++i) {
             const std::wstring path = dir + L"\\panorama_" + std::to_wstring(i) + L".png";
             if (LoadBitmapFromFile(path, panoramaFaces_[i])) {
                 ++loaded;
