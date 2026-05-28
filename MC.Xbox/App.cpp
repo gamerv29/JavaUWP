@@ -76,6 +76,8 @@ typedef jint(JNICALL* JNI_CreateJavaVM_t)(JavaVM**, void**, void*);
 
 static void WriteLog(const wchar_t* msg);
 static void WriteLogF(const wchar_t* fmt, ...);
+static std::string w2a(const std::wstring& w);
+static std::wstring a2w(const char* utf8);
 
 static std::wstring GetExecutableDir() {
     wchar_t buf[MAX_PATH];
@@ -176,6 +178,81 @@ static std::wstring GetParentDir(const std::wstring& path) {
 
 using RuntimeSeedProgressCallback = std::function<void(const wchar_t*, const wchar_t*, float)>;
 
+static std::wstring FileStamp(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA data = {};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+        return L"missing";
+    }
+
+    wchar_t stamp[96] = {};
+    swprintf_s(stamp, L"%08X%08X:%08X%08X",
+        data.ftLastWriteTime.dwHighDateTime,
+        data.ftLastWriteTime.dwLowDateTime,
+        data.nFileSizeHigh,
+        data.nFileSizeLow);
+    return stamp;
+}
+
+static bool ReadTextFile(const std::wstring& path, std::wstring& out) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+
+    std::string bytes;
+    char buffer[4096];
+    while (true) {
+        const size_t read = fread(buffer, 1, sizeof(buffer), f);
+        if (read > 0) bytes.append(buffer, read);
+        if (read < sizeof(buffer)) break;
+    }
+    fclose(f);
+
+    out = a2w(bytes.c_str());
+    return true;
+}
+
+static bool WriteTextFile(const std::wstring& path, const std::wstring& value) {
+    EnsureDirectoryTree(GetParentDir(path));
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return false;
+
+    const std::string bytes = w2a(value);
+    const bool ok = bytes.empty() || fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+    fclose(f);
+    return ok;
+}
+
+static std::wstring RuntimeSeedStamp(const std::wstring& packageDir) {
+    return L"packageDir=" + packageDir + L"\n" +
+        L"exe=" + FileStamp(packageDir + L"\\MC.Xbox.exe") + L"\n" +
+        L"manifest=" + FileStamp(packageDir + L"\\AppxManifest.xml") + L"\n" +
+        L"minecraft=" + std::wstring(kMinecraftVersionW) + L"\n";
+}
+
+static bool IsLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std::wstring& localDir) {
+    const std::wstring markerPath = localDir + L"\\.runtime_seed";
+    std::wstring marker;
+    if (!ReadTextFile(markerPath, marker)) {
+        return false;
+    }
+    if (marker != RuntimeSeedStamp(packageDir)) {
+        return false;
+    }
+
+    const bool hasGame = GetFileAttributesW((localDir + L"\\game").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool hasAssets = GetFileAttributesW((localDir + L"\\assets").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool hasNatives = GetFileAttributesW((localDir + L"\\natives").c_str()) != INVALID_FILE_ATTRIBUTES;
+    return hasGame && hasAssets && hasNatives;
+}
+
+static void MarkLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std::wstring& localDir) {
+    const std::wstring markerPath = localDir + L"\\.runtime_seed";
+    if (WriteTextFile(markerPath, RuntimeSeedStamp(packageDir))) {
+        WriteLog(L"LocalState runtime seed marker written");
+    } else {
+        WriteLogF(L"Failed to write LocalState runtime seed marker err=%u", GetLastError());
+    }
+}
+
 static void CopyFileIfNeeded(const std::wstring& src, const std::wstring& dst) {
     if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES) return;
 
@@ -247,6 +324,7 @@ static bool SeedLocalRuntime(
     if (progress) {
         progress(L"Runtime ready", L"Starting Minecraft", 1.0f);
     }
+    MarkLocalRuntimeSeedCurrent(packageDir, localDir);
     WriteLog(L"LocalState runtime seed complete");
     return true;
 }
@@ -1585,6 +1663,9 @@ static bool ResolveLaunchAuthConfig(ICoreWindow* window, LaunchAuthConfig& out) 
     }
 
     AuthUiState state;
+    state.title = L"Signing in";
+    state.showDeviceCode = false;
+    state.progress = 0.12f;
     state.verificationUri = L"microsoft.com/link";
     state.status = L"Checking saved Microsoft session";
     RenderAuth(renderer, state);
@@ -1598,9 +1679,13 @@ static bool ResolveLaunchAuthConfig(ICoreWindow* window, LaunchAuthConfig& out) 
                 SaveRefreshToken(refreshed.refreshToken);
             }
             state.status = L"Verifying Minecraft ownership";
+            state.detail = L"Using saved Microsoft session";
+            state.progress = 0.58f;
             RenderAuth(renderer, state);
             if (BuildMinecraftAuth(refreshed.accessToken, out, error)) {
                 state.status = L"Signed in as " + a2w(out.username.c_str());
+                state.detail = L"";
+                state.progress = 1.0f;
                 RenderAuth(renderer, state);
                 SleepWithAuthUi(renderer, state, 700);
                 return true;
@@ -1625,6 +1710,9 @@ static bool ResolveLaunchAuthConfig(ICoreWindow* window, LaunchAuthConfig& out) 
     state.userCode = a2w(device.userCode.c_str());
     state.verificationUri = a2w(device.verificationUri.c_str());
     state.qr = GenerateLoginQrMatrix("https://www.microsoft.com/link?otc=" + device.userCode);
+    state.title = L"Microsoft sign-in";
+    state.showDeviceCode = true;
+    state.progress = -1.0f;
     state.status = L"Waiting for Microsoft sign-in";
     state.detail = L"Use the account that owns Minecraft Java Edition.";
     state.secondsRemaining = device.expiresIn;
@@ -2179,7 +2267,7 @@ public:
             WriteLog(L"Saved Microsoft refresh token cleared by sign out");
         }
 
-        if (exeDir != packageDir) {
+        if (exeDir != packageDir && !IsLocalRuntimeSeedCurrent(packageDir, exeDir)) {
             AuthScreenRenderer prepRendererInstance;
             AuthScreenRenderer* prepRenderer = nullptr;
             if (prepRendererInstance.Initialize(g_authWindow.Get())) {
@@ -2200,6 +2288,8 @@ public:
                 });
 
             SleepWithAuthUi(prepRenderer, prepState, 350);
+        } else if (exeDir != packageDir) {
+            WriteLog(L"LocalState runtime seed is current; skipping copy");
         }
 
         // Keep java.home under the installed package. Java security startup calls
