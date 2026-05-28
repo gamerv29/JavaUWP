@@ -52,7 +52,7 @@ java -jar .\staging\cache\tools\fabric-installer.jar client -dir .\staging\cache
 .\build.ps1
 ```
 
-The build script compiles the UWP host, builds the GLFW shim, builds the compatibility mod, patches the local Fabric Loader JAR, copies launcher assets and runtime files, injects the shim into the LWJGL GLFW native JAR, creates UWP tile assets, then signs `output\MC_Java_1.0.0.0.appx`.
+The build script compiles the UWP host, builds the GLFW shim, builds the compatibility mod, patches the local Fabric Loader JAR, copies launcher assets and runtime files, injects the shim into the LWJGL GLFW native JAR, creates UWP tile assets, then signs `output\BanditLauncher_1.0.0.0.appx`.
 
 Generated files live under `staging` and `output`. They are ignored by git.
 
