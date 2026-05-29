@@ -243,10 +243,18 @@ static bool WriteTextFile(const std::wstring& path, const std::wstring& value) {
 }
 
 static std::wstring RuntimeSeedStamp(const std::wstring& packageDir) {
-    return L"packageDir=" + packageDir + L"\n" +
+    return std::wstring(L"seedVersion=2\n") +
+        L"packageDir=" + packageDir + L"\n" +
         L"exe=" + FileStamp(packageDir + L"\\MC.Xbox.exe") + L"\n" +
         L"manifest=" + FileStamp(packageDir + L"\\AppxManifest.xml") + L"\n" +
-        L"minecraft=" + std::wstring(kMinecraftVersionW) + L"\n";
+        L"minecraft=" + std::wstring(kMinecraftVersionW) + L"\n" +
+        L"jreRelease=" + FileStamp(packageDir + L"\\jre\\release") + L"\n" +
+        L"jvm=" + FileStamp(packageDir + L"\\jre\\bin\\server\\jvm.dll") + L"\n" +
+        L"securityPatch=" + FileStamp(packageDir + L"\\java-base-security-realpath.jar") + L"\n" +
+        L"nativeGlfw=" + FileStamp(packageDir + L"\\natives\\glfw.dll") + L"\n" +
+        L"nativeLwjgl=" + FileStamp(packageDir + L"\\natives\\lwjgl.dll") + L"\n" +
+        L"mesaOpenGl=" + FileStamp(packageDir + L"\\graphics\\mesa\\opengl32.dll") + L"\n" +
+        L"xboxOneOpenGl=" + FileStamp(packageDir + L"\\graphics\\xboxone\\opengl32.dll") + L"\n";
 }
 
 static bool IsLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std::wstring& localDir) {
@@ -2959,6 +2967,8 @@ public:
 
         WriteLogF(L"exeDir: %s", exeDir.c_str());
         WriteLogF(L"jreDir: %s", jreDir.c_str());
+        WriteLogF(L"jre release stamp: %s", FileStamp(jreDir + L"\\release").c_str());
+        WriteLogF(L"package jre release stamp: %s", FileStamp(packageJreDir + L"\\release").c_str());
         WriteLogF(L"classpathGameDir: %s", classpathGameDir.c_str());
         WriteLogF(L"bundledModsDir: %s", bundledModsDir.c_str());
         WriteLogF(L"userModsDir: %s", userModsDir.c_str());
