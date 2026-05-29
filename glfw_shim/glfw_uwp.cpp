@@ -299,6 +299,9 @@ static int g_wait_log_count = 0;
 static int g_key_log_count = 0;
 static int g_controller_log_count = 0;
 static int g_gamepad_query_log_count = 0;
+static int g_current_context_log_count = 0;
+static int g_window_attrib_log_count = 0;
+static int g_extension_log_count = 0;
 
 static PFN_eglGetDisplay p_eglGetDisplay = nullptr;
 static PFN_eglGetPlatformDisplay p_eglGetPlatformDisplay = nullptr;
@@ -1353,6 +1356,10 @@ extern "C" __declspec(dllexport) void glfwRequestWindowAttention(GLFWwindow*) {}
 extern "C" __declspec(dllexport) GLFWmonitor* glfwGetWindowMonitor(GLFWwindow*) { return NULL; }
 extern "C" __declspec(dllexport) void glfwSetWindowMonitor(GLFWwindow*, GLFWmonitor*, int, int, int, int, int) {}
 extern "C" __declspec(dllexport) int glfwGetWindowAttrib(GLFWwindow*, int a) {
+    if (g_window_attrib_log_count < 32) {
+        ++g_window_attrib_log_count;
+        ShimLog("glfwGetWindowAttrib #%d attr=0x%08X", g_window_attrib_log_count, a);
+    }
     switch (a) {
     case GLFW_VISIBLE:
     case GLFW_FOCUSED:
@@ -1547,28 +1554,16 @@ extern "C" __declspec(dllexport) void glfwMakeContextCurrent(GLFWwindow* w) {
     }
     g_eglContextThreadId = tid;
     ShimLog("eglMakeCurrent OK tid=%lu", tid);
-
-    PFN_glGetString p_glGetString = nullptr;
-    if (g_opengl32) {
-        p_glGetString = reinterpret_cast<PFN_glGetString>(GetProcAddress(g_opengl32, "glGetString"));
-    }
-    if (!p_glGetString && p_eglGetProcAddress) {
-        p_glGetString = reinterpret_cast<PFN_glGetString>(p_eglGetProcAddress("glGetString"));
-    }
-    if (p_glGetString) {
-        const unsigned char* vendor = p_glGetString(GL_VENDOR);
-        const unsigned char* renderer = p_glGetString(GL_RENDERER);
-        const unsigned char* version = p_glGetString(GL_VERSION);
-        ShimLog("GL vendor=%s renderer=%s version=%s",
-            vendor ? reinterpret_cast<const char*>(vendor) : "?",
-            renderer ? reinterpret_cast<const char*>(renderer) : "?",
-            version ? reinterpret_cast<const char*>(version) : "?");
-    } else {
-        ShimLog("glGetString unresolved");
-    }
 }
 extern "C" __declspec(dllexport) GLFWwindow* glfwGetCurrentContext(void) {
-    return (g_eglContext != EGL_NO_CONTEXT && g_eglContextThreadId == GetCurrentThreadId()) ? (GLFWwindow*)&g_fake_window : NULL;
+    const DWORD tid = GetCurrentThreadId();
+    GLFWwindow* current = (g_eglContext != EGL_NO_CONTEXT && g_eglContextThreadId == tid) ? (GLFWwindow*)&g_fake_window : NULL;
+    if (g_current_context_log_count < 16) {
+        ++g_current_context_log_count;
+        ShimLog("glfwGetCurrentContext #%d tid=%lu boundTid=%lu => %p",
+            g_current_context_log_count, tid, g_eglContextThreadId, (void*)current);
+    }
+    return current;
 }
 extern "C" __declspec(dllexport) void glfwSwapBuffers(GLFWwindow*) {
     if (g_swap_log_count < 12) {
@@ -1585,7 +1580,14 @@ extern "C" __declspec(dllexport) void glfwSwapInterval(int i) {
         p_eglSwapInterval(g_eglDisplay, i);
     }
 }
-extern "C" __declspec(dllexport) int  glfwExtensionSupported(const char*) { return GLFW_FALSE; }
+extern "C" __declspec(dllexport) int glfwExtensionSupported(const char* name) {
+    if (g_extension_log_count < 32) {
+        ++g_extension_log_count;
+        ShimLog("glfwExtensionSupported #%d %s => false",
+            g_extension_log_count, name ? name : "(null)");
+    }
+    return GLFW_FALSE;
+}
 extern "C" __declspec(dllexport) void* glfwGetProcAddress(const char* name) {
     void* p = NULL;
     if (g_graphicsRuntimeUsesGles && g_opengl32) p = (void*)GetProcAddress(g_opengl32, name);

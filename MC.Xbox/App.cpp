@@ -2284,7 +2284,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     }
     vmOptionStorage.push_back("-Djava.home=" + w2a(fwd(jreDir)));
     vmOptionStorage.push_back("-Djava.security.properties==" + w2a(fwd(jreDir + L"\\conf\\security\\xbox.properties")));
-    vmOptionStorage.push_back("-Djava.security.egd=file:/dev/./urandom");
+    vmOptionStorage.push_back("-Djava.security.egd=file:/dev/urandom");
     vmOptionStorage.push_back("-Dfabric.log.file=" + w2a(fwd(fabricLogPath)));
     vmOptionStorage.push_back("-Dfabric.log.level=debug");
     vmOptionStorage.push_back("-Dfabric.debug.throwDirectly=true");
