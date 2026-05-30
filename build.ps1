@@ -28,7 +28,6 @@ $pkg = Get-ConfigPath "PackageContentDir"
 $buildDir = Get-ConfigPath "BuildDir"
 $outDir = Get-ConfigPath "OutputDir"
 $gameDir = Get-ConfigPath "GameDir"
-$assetsDir = Get-ConfigPath "AssetsDir"
 $nativesSourceDir = Get-ConfigPath "NativesDir"
 $certDir = Get-ConfigPath "CertificateDir"
 $mcBuildDir = Join-Path $buildDir "MC.Xbox"
@@ -36,6 +35,8 @@ $glfwBuildDir = Join-Path $buildDir "glfw_shim"
 $mcExe = Join-Path $mcBuildDir "MC.Xbox.exe"
 $shimDll = Join-Path $glfwBuildDir "glfw.dll"
 $jreSrc = Resolve-JavaHome
+$jarExe = Join-Path $jreSrc "bin\jar.exe"
+if (-not (Test-Path $jarExe)) { $jarExe = "jar" }
 $pythonExe = Resolve-Python
 $tools = Resolve-VSTools
 $sdk = Resolve-WindowsSdk
@@ -273,7 +274,7 @@ $env:LIB = "$($tools.MsvcRoot)\lib\x64;${sdkRoot}Lib\$sdkVer\ucrt\x64;${sdkRoot}
 & $tools.ClExe App.cpp /std:c++17 /EHsc /W3 /O2 /D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00 /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS /Fo"$mcBuildDir\" `
     /DWINAPI_FAMILY=WINAPI_FAMILY_APP `
     /link /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup /MACHINE:X64 `
-    /OUT:"$mcExe" kernel32.lib shell32.lib runtimeobject.lib windowsapp.lib ole32.lib oleaut32.lib d2d1.lib dwrite.lib d3d11.lib dxgi.lib windowscodecs.lib
+    /OUT:"$mcExe" kernel32.lib shell32.lib runtimeobject.lib windowsapp.lib ole32.lib oleaut32.lib d2d1.lib dwrite.lib d3d11.lib dxgi.lib windowscodecs.lib winhttp.lib bcrypt.lib
 if ($LASTEXITCODE -ne 0) { throw "Compile failed" }
 Pop-Location
 Write-Host "MC.Xbox.exe built"
@@ -293,33 +294,29 @@ New-Item -ItemType Directory -Force -Path (Join-Path $pkg "Assets") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $pkg "natives") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $pkg "graphics\mesa") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $pkg "graphics\xboxone") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $pkg "assets") | Out-Null
-# runtime/ holds the immutable game stack (libraries, versions, fabric remapped
-# jars, bundled mods, log configs). Writable state (saves, mods folder,
-# config, logs) lives in LocalState and is set up by App.cpp at startup.
+# runtime/ holds only launcher-owned or intentionally patched runtime pieces.
+# Mojang/Fabric game files are downloaded into LocalState after auth.
 New-Item -ItemType Directory -Force -Path (Join-Path $pkg "runtime") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $pkg "runtime\log_configs") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $pkg "runtime\bundled-mods") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $pkg "runtime\libraries") | Out-Null
 
 Copy-Item $mcExe (Join-Path $pkg "MC.Xbox.exe")
 Copy-Item (Join-Path $root "MC.Xbox\Package.appxmanifest") (Join-Path $pkg "AppxManifest.xml")
 
-Write-Host "Copying runtime files..."
-Copy-Item -Recurse (Join-Path $gameDir "libraries") (Join-Path $pkg "runtime\libraries")
-Copy-Item -Recurse (Join-Path $gameDir "versions")  (Join-Path $pkg "runtime\versions")
+Write-Host "Copying launcher-owned runtime files..."
+$loaderVersion = $ProjectConfig.FabricLoaderVersion
+$loaderRelative = "net\fabricmc\fabric-loader\$loaderVersion\fabric-loader-$loaderVersion.jar"
+$loaderSrc = Join-Path $gameDir "libraries\$loaderRelative"
+$loaderDst = Join-Path $pkg "runtime\libraries\$loaderRelative"
+if (-not (Test-Path $loaderSrc)) {
+    throw "Patched Fabric loader missing at $loaderSrc"
+}
+New-Item -ItemType Directory -Force -Path (Split-Path $loaderDst -Parent) | Out-Null
+Copy-Item $loaderSrc $loaderDst -Force
 # Bundled mods (compat mod, optionally diagnostics) live under runtime\bundled-mods.
 # App.cpp copies them into LocalState\game\mods on launch.
 Copy-Item -Recurse (Join-Path $gameDir "mods\*") (Join-Path $pkg "runtime\bundled-mods\") -Force
-if (Test-Path (Join-Path $gameDir ".fabric")) {
-    Copy-Item -Recurse (Join-Path $gameDir ".fabric") (Join-Path $pkg "runtime\.fabric")
-}
-
-$remapped = Join-Path $gameDir ".fabric\remappedJars"
-if (Test-Path $remapped) {
-    Write-Host "Copying .fabric remapped jars..."
-    New-Item -ItemType Directory -Force (Join-Path $pkg "runtime\.fabric\remappedJars") | Out-Null
-    Copy-Item -Recurse (Join-Path $remapped "*") (Join-Path $pkg "runtime\.fabric\remappedJars\") -Force
-}
 
 Write-Host "Copying natives..."
 Copy-Item (Join-Path $nativesSourceDir "*.dll") (Join-Path $pkg "natives\")
@@ -343,35 +340,7 @@ if (Test-Path $jnaJar) {
     }
 }
 
-Write-Host "Injecting GLFW shim into LWJGL JAR..."
-$lwjglGlfwVersion = $ProjectConfig.LwjglGlfwVersion
-$glfwJar  = Join-Path $pkg "runtime\libraries\org\lwjgl\lwjgl-glfw\$lwjglGlfwVersion\lwjgl-glfw-$lwjglGlfwVersion-natives-windows.jar"
-$jarExe   = Join-Path $jreSrc "bin\jar.exe"
-if (-not (Test-Path $jarExe)) { $jarExe = "jar" }
-
-if (Test-Path $glfwJar) {
-    # Extract JAR into a fresh temp dir, replace glfw.dll, repack
-    $jarTmpDir = Join-Path $buildDir "glfw_jar_tmp"
-    Remove-Item -Recurse -Force $jarTmpDir -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force -Path $jarTmpDir | Out-Null
-    Push-Location $jarTmpDir
-    & $jarExe xf $glfwJar
-    Pop-Location
-
-    $glfwInJar = Get-ChildItem -Recurse $jarTmpDir -Filter "glfw.dll" | Select-Object -First 1
-    if ($glfwInJar) {
-        Copy-Item $shimDll $glfwInJar.FullName -Force
-        Write-Host "  Replaced $($glfwInJar.FullName)"
-        Push-Location $jarTmpDir
-        & $jarExe cf $glfwJar .
-        Pop-Location
-        Write-Host "  JAR repacked: $glfwJar"
-    } else {
-        Write-Warning "  glfw.dll entry not found inside JAR after extraction"
-    }
-} else {
-    Write-Warning "  LWJGL GLFW JAR not found: $glfwJar"
-}
+Write-Host "Copying GLFW shim..."
 Copy-Item $shimDll (Join-Path $pkg "natives\glfw.dll") -Force
 
 Write-Host "Copying Mesa runtime..."
@@ -409,8 +378,12 @@ if ($xboxOneRuntime) {
     }
 }
 
-Write-Host "Copying assets..."
-Copy-Item -Recurse -Force (Join-Path $assetsDir "*") (Join-Path $pkg "assets\")
+Write-Host "Generating official download manifest..."
+& (Join-Path $root "scripts\new-download-manifest.ps1") `
+    -MinecraftVersion $ProjectConfig.MinecraftVersion `
+    -FabricLoaderVersion $ProjectConfig.FabricLoaderVersion `
+    -OutputPath (Join-Path $pkg "download_manifest.tsv")
+
 Copy-Item -Force (Join-Path $root "log_configs\client-uwp.xml") (Join-Path $pkg "runtime\log_configs\client-uwp.xml")
 
 $panoramaSource = Join-Path $root "MC.Xbox\Assets\panorama"

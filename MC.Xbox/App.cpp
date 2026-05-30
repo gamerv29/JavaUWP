@@ -34,6 +34,8 @@
 #include <wincodec.h>
 #include <sstream>
 #include <iomanip>
+#include <winhttp.h>
+#include <bcrypt.h>
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Security.Credentials.h>
@@ -243,14 +245,18 @@ static bool WriteTextFile(const std::wstring& path, const std::wstring& value) {
 }
 
 static std::wstring RuntimeSeedStamp(const std::wstring& packageDir) {
-    return std::wstring(L"seedVersion=2\n") +
+    return std::wstring(L"seedVersion=3\n") +
         L"packageDir=" + packageDir + L"\n" +
         L"exe=" + FileStamp(packageDir + L"\\MC.Xbox.exe") + L"\n" +
         L"manifest=" + FileStamp(packageDir + L"\\AppxManifest.xml") + L"\n" +
+        L"downloadManifest=" + FileStamp(packageDir + L"\\download_manifest.tsv") + L"\n" +
         L"minecraft=" + std::wstring(kMinecraftVersionW) + L"\n" +
         L"jreRelease=" + FileStamp(packageDir + L"\\jre\\release") + L"\n" +
         L"jvm=" + FileStamp(packageDir + L"\\jre\\bin\\server\\jvm.dll") + L"\n" +
         L"securityPatch=" + FileStamp(packageDir + L"\\java-base-security-realpath.jar") + L"\n" +
+        L"patchedFabricLoader=" + FileStamp(packageDir + L"\\runtime\\libraries\\net\\fabricmc\\fabric-loader\\" + a2w(kFabricLoaderVersion) + L"\\fabric-loader-" + a2w(kFabricLoaderVersion) + L".jar") + L"\n" +
+        L"bundledMods=" + FileStamp(packageDir + L"\\runtime\\bundled-mods") + L"\n" +
+        L"logConfig=" + FileStamp(packageDir + L"\\runtime\\log_configs\\client-uwp.xml") + L"\n" +
         L"nativeGlfw=" + FileStamp(packageDir + L"\\natives\\glfw.dll") + L"\n" +
         L"nativeLwjgl=" + FileStamp(packageDir + L"\\natives\\lwjgl.dll") + L"\n" +
         L"mesaOpenGl=" + FileStamp(packageDir + L"\\graphics\\mesa\\opengl32.dll") + L"\n" +
@@ -267,8 +273,9 @@ static bool IsLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std:
         return false;
     }
 
-    const bool hasGame = GetFileAttributesW((localDir + L"\\game").c_str()) != INVALID_FILE_ATTRIBUTES;
-    const bool hasAssets = GetFileAttributesW((localDir + L"\\assets").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool hasGameSupport =
+        GetFileAttributesW((localDir + L"\\game\\mods").c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW((localDir + L"\\game\\log_configs\\client-uwp.xml").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool hasNatives = GetFileAttributesW((localDir + L"\\natives").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool hasGraphics = GetFileAttributesW((localDir + L"\\graphics").c_str()) != INVALID_FILE_ATTRIBUTES ||
         GetFileAttributesW((localDir + L"\\natives\\opengl32.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
@@ -277,7 +284,7 @@ static bool IsLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std:
         GetFileAttributesW((localDir + L"\\jre\\conf\\security\\java.security").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool hasJavaSecurityPatch =
         GetFileAttributesW((localDir + L"\\java-base-security-realpath.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
-    return hasGame && hasAssets && hasNatives && hasGraphics && hasJre && hasJavaSecurityPatch;
+    return hasGameSupport && hasNatives && hasGraphics && hasJre && hasJavaSecurityPatch;
 }
 
 static void MarkLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std::wstring& localDir) {
@@ -335,22 +342,13 @@ static bool SeedLocalRuntime(
 
     EnsureDirectoryTree(localDir);
     WriteLogF(L"Seeding LocalState runtime from %s", packageDir.c_str());
-    const std::wstring runtimeDir = packageDir + L"\\runtime";
-    const std::wstring legacyGameDir = packageDir + L"\\game";
-    const std::wstring gameSeedDir =
-        GetFileAttributesW(runtimeDir.c_str()) != INVALID_FILE_ATTRIBUTES ? runtimeDir : legacyGameDir;
-    WriteLogF(L"Game seed source: %s", gameSeedDir.c_str());
-
     if (progress) {
-        progress(L"Copying game runtime", L"Preparing Java libraries and Minecraft files", 0.12f);
+        progress(L"Copying launcher files", L"Preparing mods and log configuration", 0.12f);
     }
-    CopyDirectoryContentsIfNeeded(gameSeedDir, localDir + L"\\game");
+    CopyDirectoryContentsIfNeeded(packageDir + L"\\runtime\\bundled-mods", localDir + L"\\game\\mods");
+    CopyDirectoryContentsIfNeeded(packageDir + L"\\runtime\\log_configs", localDir + L"\\game\\log_configs");
     if (progress) {
-        progress(L"Copying assets", L"Preparing Minecraft assets", 0.52f);
-    }
-    CopyDirectoryContentsIfNeeded(packageDir + L"\\assets", localDir + L"\\assets");
-    if (progress) {
-        progress(L"Copying Java runtime", L"Preparing JVM files", 0.68f);
+        progress(L"Copying Java runtime", L"Preparing JVM files", 0.52f);
     }
     CopyDirectoryContentsIfNeeded(packageDir + L"\\jre", localDir + L"\\jre");
     std::wstring xboxSecurityProperties;
@@ -366,7 +364,7 @@ static bool SeedLocalRuntime(
         WriteLogF(L"Failed to read packaged xbox_security.properties err=%u", GetLastError());
     }
     if (progress) {
-        progress(L"Copying native libraries", L"Preparing graphics and input runtime", 0.84f);
+        progress(L"Copying native libraries", L"Preparing graphics and input runtime", 0.80f);
     }
     CopyDirectoryContentsIfNeeded(packageDir + L"\\natives", localDir + L"\\natives");
     CopyDirectoryContentsIfNeeded(packageDir + L"\\graphics", localDir + L"\\graphics");
@@ -778,6 +776,491 @@ static std::wstring GetEnvVarString(const wchar_t* name) {
     if (GetEnvironmentVariableW(name, value.data(), len) == 0) return std::wstring();
     if (!value.empty() && value.back() == L'\0') value.pop_back();
     return value;
+}
+
+struct DownloadManifestEntry {
+    std::wstring relativePath;
+    std::wstring url;
+    std::string sha1;
+    unsigned long long size = 0;
+};
+
+using DownloadProgressCallback = std::function<void(const wchar_t*, const wchar_t*, float)>;
+
+static std::wstring TrimTrailingSlash(std::wstring path) {
+    while (!path.empty() && (path.back() == L'\\' || path.back() == L'/')) {
+        path.pop_back();
+    }
+    return path;
+}
+
+static std::wstring JoinRuntimeRelativePath(const std::wstring& root, std::wstring relativePath) {
+    for (wchar_t& ch : relativePath) {
+        if (ch == L'/') ch = L'\\';
+    }
+
+    if (relativePath.empty() ||
+        relativePath[0] == L'\\' ||
+        relativePath.find(L":") != std::wstring::npos) {
+        return std::wstring();
+    }
+
+    size_t start = 0;
+    while (start <= relativePath.size()) {
+        const size_t slash = relativePath.find(L'\\', start);
+        const std::wstring segment = relativePath.substr(
+            start,
+            slash == std::wstring::npos ? std::wstring::npos : slash - start);
+        if (segment.empty() || segment == L"." || segment == L"..") {
+            return std::wstring();
+        }
+        if (slash == std::wstring::npos) break;
+        start = slash + 1;
+    }
+
+    return TrimTrailingSlash(root) + L"\\" + relativePath;
+}
+
+static std::string ToLowerAscii(std::string value) {
+    for (char& ch : value) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>((ch - 'A') + 'a');
+        }
+    }
+    return value;
+}
+
+static std::string BytesToHex(const unsigned char* data, size_t length) {
+    static const char* digits = "0123456789abcdef";
+    std::string out;
+    out.reserve(length * 2);
+    for (size_t i = 0; i < length; ++i) {
+        out.push_back(digits[(data[i] >> 4) & 0xF]);
+        out.push_back(digits[data[i] & 0xF]);
+    }
+    return out;
+}
+
+static bool Sha1File(const std::wstring& path, std::string* outHex) {
+    if (!outHex) return false;
+
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) {
+        return false;
+    }
+
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectLength = 0;
+    DWORD dataLength = 0;
+    std::vector<unsigned char> hashObject;
+    unsigned char hashBytes[20] = {};
+    bool ok = false;
+
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM, nullptr, 0) != 0) goto done;
+    if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectLength),
+        sizeof(objectLength), &dataLength, 0) != 0 || objectLength == 0) goto done;
+
+    hashObject.resize(objectLength);
+    if (BCryptCreateHash(alg, &hash, hashObject.data(), objectLength, nullptr, 0, 0) != 0) goto done;
+
+    {
+        unsigned char buffer[64 * 1024];
+        for (;;) {
+            const size_t read = fread(buffer, 1, sizeof(buffer), f);
+            if (read > 0 && BCryptHashData(hash, buffer, static_cast<ULONG>(read), 0) != 0) goto done;
+            if (read < sizeof(buffer)) {
+                if (ferror(f)) goto done;
+                break;
+            }
+        }
+    }
+
+    if (BCryptFinishHash(hash, hashBytes, sizeof(hashBytes), 0) != 0) goto done;
+    *outHex = BytesToHex(hashBytes, sizeof(hashBytes));
+    ok = true;
+
+done:
+    if (hash) BCryptDestroyHash(hash);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    fclose(f);
+    return ok;
+}
+
+static bool FileMatchesSha1(const std::wstring& path, const std::string& expectedSha1) {
+    if (expectedSha1.empty()) {
+        return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
+
+    std::string actual;
+    if (!Sha1File(path, &actual)) return false;
+    return ToLowerAscii(actual) == ToLowerAscii(expectedSha1);
+}
+
+static bool ReadDownloadManifest(const std::wstring& path, std::vector<DownloadManifestEntry>& entries) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return false;
+
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+
+        std::vector<std::string> parts;
+        size_t start = 0;
+        for (;;) {
+            const size_t tab = line.find('\t', start);
+            parts.push_back(line.substr(start, tab == std::string::npos ? std::string::npos : tab - start));
+            if (tab == std::string::npos) break;
+            start = tab + 1;
+        }
+
+        if (parts.size() < 4) {
+            WriteLogF(L"Skipping malformed download manifest line: %s", a2w(line.c_str()).c_str());
+            continue;
+        }
+
+        unsigned long long size = 0;
+        try {
+            size = parts[2].empty() ? 0 : std::stoull(parts[2]);
+        } catch (...) {
+            size = 0;
+        }
+
+        entries.push_back(DownloadManifestEntry{
+            a2w(parts[0].c_str()),
+            a2w(parts[3].c_str()),
+            ToLowerAscii(parts[1]),
+            size
+        });
+    }
+
+    return true;
+}
+
+static std::wstring BuildRedirectUrl(const std::wstring& currentUrl, const std::wstring& location) {
+    if (location.find(L"://") != std::wstring::npos) {
+        return location;
+    }
+
+    URL_COMPONENTS uc = {};
+    uc.dwStructSize = sizeof(uc);
+    uc.dwSchemeLength = static_cast<DWORD>(-1);
+    uc.dwHostNameLength = static_cast<DWORD>(-1);
+    uc.dwUrlPathLength = static_cast<DWORD>(-1);
+    uc.dwExtraInfoLength = static_cast<DWORD>(-1);
+
+    std::wstring mutableUrl = currentUrl;
+    if (!WinHttpCrackUrl(mutableUrl.c_str(), 0, 0, &uc)) {
+        return location;
+    }
+
+    std::wstring scheme(uc.lpszScheme, uc.dwSchemeLength);
+    std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
+    std::wstring path(uc.lpszUrlPath, uc.dwUrlPathLength);
+    std::wstring extra;
+    if (uc.dwExtraInfoLength > 0) {
+        extra.assign(uc.lpszExtraInfo, uc.dwExtraInfoLength);
+    }
+
+    if (!location.empty() && location[0] == L'/') {
+        return scheme + L"://" + host + location;
+    }
+
+    const size_t slash = path.find_last_of(L'/');
+    path = slash == std::wstring::npos ? L"/" : path.substr(0, slash + 1);
+    return scheme + L"://" + host + path + location;
+}
+
+static bool DownloadUrlToFile(
+    const std::wstring& url,
+    const std::wstring& destination,
+    const std::function<void(unsigned long long)>& progressCallback) {
+    std::wstring currentUrl = url;
+
+    for (int redirect = 0; redirect < 6; ++redirect) {
+        URL_COMPONENTS uc = {};
+        uc.dwStructSize = sizeof(uc);
+        uc.dwSchemeLength = static_cast<DWORD>(-1);
+        uc.dwHostNameLength = static_cast<DWORD>(-1);
+        uc.dwUrlPathLength = static_cast<DWORD>(-1);
+        uc.dwExtraInfoLength = static_cast<DWORD>(-1);
+
+        std::wstring mutableUrl = currentUrl;
+        if (!WinHttpCrackUrl(mutableUrl.c_str(), 0, 0, &uc)) {
+            WriteLogF(L"WinHttpCrackUrl failed err=%u url=%s", GetLastError(), currentUrl.c_str());
+            return false;
+        }
+
+        std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
+        std::wstring objectName;
+        if (uc.dwUrlPathLength > 0) objectName.assign(uc.lpszUrlPath, uc.dwUrlPathLength);
+        if (uc.dwExtraInfoLength > 0) objectName.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
+        if (objectName.empty()) objectName = L"/";
+
+        HINTERNET session = WinHttpOpen(
+            L"MinecraftJavaUWP/1.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS,
+            0);
+        if (!session) {
+            WriteLogF(L"WinHttpOpen failed err=%u", GetLastError());
+            return false;
+        }
+
+        HINTERNET connect = WinHttpConnect(session, host.c_str(), uc.nPort, 0);
+        if (!connect) {
+            WriteLogF(L"WinHttpConnect failed err=%u host=%s", GetLastError(), host.c_str());
+            WinHttpCloseHandle(session);
+            return false;
+        }
+
+        const DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET request = WinHttpOpenRequest(
+            connect,
+            L"GET",
+            objectName.c_str(),
+            nullptr,
+            WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            flags);
+        if (!request) {
+            WriteLogF(L"WinHttpOpenRequest failed err=%u path=%s", GetLastError(), objectName.c_str());
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return false;
+        }
+
+        BOOL sent = WinHttpSendRequest(
+            request,
+            WINHTTP_NO_ADDITIONAL_HEADERS,
+            0,
+            WINHTTP_NO_REQUEST_DATA,
+            0,
+            0,
+            0);
+        BOOL received = sent ? WinHttpReceiveResponse(request, nullptr) : FALSE;
+        if (!sent || !received) {
+            WriteLogF(L"WinHttp request failed err=%u url=%s", GetLastError(), currentUrl.c_str());
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return false;
+        }
+
+        DWORD status = 0;
+        DWORD statusSize = sizeof(status);
+        if (!WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &status,
+            &statusSize,
+            WINHTTP_NO_HEADER_INDEX)) {
+            WriteLogF(L"WinHttpQueryHeaders(status) failed err=%u", GetLastError());
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return false;
+        }
+
+        if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+            DWORD locationBytes = 0;
+            WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_LOCATION,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                WINHTTP_NO_OUTPUT_BUFFER,
+                &locationBytes,
+                WINHTTP_NO_HEADER_INDEX);
+            std::vector<wchar_t> location((locationBytes / sizeof(wchar_t)) + 1);
+            if (locationBytes > 0 &&
+                WinHttpQueryHeaders(
+                    request,
+                    WINHTTP_QUERY_LOCATION,
+                    WINHTTP_HEADER_NAME_BY_INDEX,
+                    location.data(),
+                    &locationBytes,
+                    WINHTTP_NO_HEADER_INDEX)) {
+                currentUrl = BuildRedirectUrl(currentUrl, location.data());
+                WinHttpCloseHandle(request);
+                WinHttpCloseHandle(connect);
+                WinHttpCloseHandle(session);
+                continue;
+            }
+        }
+
+        if (status != 200) {
+            WriteLogF(L"Download failed HTTP %u url=%s", status, currentUrl.c_str());
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return false;
+        }
+
+        EnsureDirectoryTree(GetParentDir(destination));
+        FILE* out = nullptr;
+        if (_wfopen_s(&out, destination.c_str(), L"wb") != 0 || !out) {
+            WriteLogF(L"Could not open download output %s err=%u", destination.c_str(), GetLastError());
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return false;
+        }
+
+        bool ok = true;
+        unsigned long long fileBytesRead = 0;
+        unsigned char buffer[64 * 1024];
+        for (;;) {
+            DWORD bytesRead = 0;
+            if (!WinHttpReadData(request, buffer, sizeof(buffer), &bytesRead)) {
+                WriteLogF(L"WinHttpReadData failed err=%u url=%s", GetLastError(), currentUrl.c_str());
+                ok = false;
+                break;
+            }
+            if (bytesRead == 0) break;
+            if (fwrite(buffer, 1, bytesRead, out) != bytesRead) {
+                WriteLogF(L"fwrite failed while downloading %s", destination.c_str());
+                ok = false;
+                break;
+            }
+            fileBytesRead += bytesRead;
+            if (progressCallback) {
+                progressCallback(fileBytesRead);
+            }
+        }
+
+        fclose(out);
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return ok;
+    }
+
+    WriteLogF(L"Too many redirects url=%s", url.c_str());
+    return false;
+}
+
+static bool EnsureRuntimeDownloads(
+    const std::wstring& manifestPath,
+    const std::wstring& runtimeRoot,
+    const DownloadProgressCallback& progress = DownloadProgressCallback()) {
+    if (GetFileAttributesW(manifestPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        WriteLogF(L"No download manifest found at %s", manifestPath.c_str());
+        return false;
+    }
+
+    std::vector<DownloadManifestEntry> entries;
+    if (!ReadDownloadManifest(manifestPath, entries)) {
+        WriteLogF(L"Failed to read download manifest: %s", manifestPath.c_str());
+        return false;
+    }
+    if (entries.empty()) {
+        WriteLog(L"Download manifest is empty");
+        if (progress) progress(L"No downloads needed", L"Launching Minecraft", 1.0f);
+        return true;
+    }
+
+    unsigned long long totalBytes = 0;
+    for (const auto& entry : entries) {
+        totalBytes += entry.size;
+    }
+
+    size_t verified = 0;
+    size_t downloaded = 0;
+    unsigned long long completedBytes = 0;
+    const std::wstring totalText = std::to_wstring(entries.size()) + L" files, " +
+        std::to_wstring(totalBytes / (1024ULL * 1024ULL)) + L" MB";
+    auto formatDownloadDetail = [&](size_t fileIndex, unsigned long long bytesDone) {
+        return std::to_wstring(fileIndex) + L"/" + std::to_wstring(entries.size()) +
+            L" files  " + std::to_wstring(bytesDone / (1024ULL * 1024ULL)) +
+            L"/" + std::to_wstring(totalBytes / (1024ULL * 1024ULL)) + L" MB";
+    };
+    WriteLogF(L"Download manifest entries=%zu totalBytes=%llu", entries.size(), totalBytes);
+    if (progress) progress(L"Preparing download", totalText.c_str(), 0.0f);
+
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& entry = entries[i];
+        const std::wstring finalPath = JoinRuntimeRelativePath(runtimeRoot, entry.relativePath);
+        if (finalPath.empty()) {
+            WriteLogF(L"Invalid manifest relative path: %s", entry.relativePath.c_str());
+            return false;
+        }
+
+        if (FileMatchesSha1(finalPath, entry.sha1)) {
+            ++verified;
+            completedBytes += entry.size;
+            if (progress && (verified < 25 || verified % 100 == 0 || verified == entries.size())) {
+                const float ratio = totalBytes > 0
+                    ? static_cast<float>(static_cast<double>(completedBytes) / static_cast<double>(totalBytes))
+                    : static_cast<float>(static_cast<double>(verified) / static_cast<double>(entries.size()));
+                const std::wstring detail = formatDownloadDetail(verified, completedBytes);
+                progress(L"Checking installed files", detail.c_str(), ratio);
+            }
+            continue;
+        }
+
+        const std::wstring tempPath = finalPath + L".download";
+        DeleteFileW(tempPath.c_str());
+        if (downloaded < 25 || downloaded % 100 == 0) {
+            WriteLogF(L"Downloading [%zu/%zu] %s", i + 1, entries.size(), entry.relativePath.c_str());
+        }
+
+        if (progress) {
+            const float ratio = totalBytes > 0
+                ? static_cast<float>(static_cast<double>(completedBytes) / static_cast<double>(totalBytes))
+                : static_cast<float>(static_cast<double>(i) / static_cast<double>(entries.size()));
+            const std::wstring detail = formatDownloadDetail(i + 1, completedBytes);
+            progress(L"Downloading Minecraft files", detail.c_str(), ratio);
+        }
+
+        auto progressCallback = [&](unsigned long long fileBytesRead) {
+            if (!progress) return;
+            const unsigned long long cappedFileBytes = entry.size > 0
+                ? std::min<unsigned long long>(fileBytesRead, entry.size)
+                : 0;
+            const float ratio = totalBytes > 0
+                ? static_cast<float>(static_cast<double>(completedBytes + cappedFileBytes) / static_cast<double>(totalBytes))
+                : static_cast<float>(static_cast<double>(i) / static_cast<double>(entries.size()));
+            const std::wstring detail = formatDownloadDetail(i + 1, completedBytes + cappedFileBytes);
+            progress(L"Downloading Minecraft files", detail.c_str(), ratio);
+        };
+
+        if (!DownloadUrlToFile(entry.url, tempPath, progressCallback)) {
+            DeleteFileW(tempPath.c_str());
+            if (progress) progress(L"Download failed", entry.relativePath.c_str(), 0.0f);
+            return false;
+        }
+
+        if (!FileMatchesSha1(tempPath, entry.sha1)) {
+            std::string actual;
+            Sha1File(tempPath, &actual);
+            WriteLogF(L"SHA1 mismatch for %s expected=%s actual=%s",
+                entry.relativePath.c_str(),
+                a2w(entry.sha1.c_str()).c_str(),
+                a2w(actual.c_str()).c_str());
+            DeleteFileW(tempPath.c_str());
+            if (progress) progress(L"File verification failed", entry.relativePath.c_str(), 0.0f);
+            return false;
+        }
+
+        EnsureDirectoryTree(GetParentDir(finalPath));
+        DeleteFileW(finalPath.c_str());
+        if (!MoveFileExW(tempPath.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            WriteLogF(L"MoveFileEx failed for %s err=%u", finalPath.c_str(), GetLastError());
+            DeleteFileW(tempPath.c_str());
+            return false;
+        }
+
+        completedBytes += entry.size;
+        ++downloaded;
+        ++verified;
+    }
+
+    WriteLogF(L"Download pass complete verified=%zu downloaded=%zu", verified, downloaded);
+    if (progress) progress(L"Download complete", L"Launching Minecraft", 1.0f);
+    return true;
 }
 
 static bool ContainsInsensitive(const std::wstring& value, const wchar_t* needle) {
@@ -2945,6 +3428,42 @@ public:
             WriteLog(L"LocalState runtime seed is current; skipping copy");
         }
 
+        {
+            AuthScreenRenderer downloadRendererInstance;
+            AuthScreenRenderer* downloadRenderer = nullptr;
+            if (downloadRendererInstance.Initialize(g_authWindow.Get())) {
+                downloadRenderer = &downloadRendererInstance;
+            }
+
+            AuthUiState downloadState;
+            const std::wstring manifestPath = packageDir + L"\\download_manifest.tsv";
+            RenderPreparationProgress(
+                downloadRenderer,
+                downloadState,
+                L"Checking installed files",
+                L"Validating Minecraft downloads",
+                0.0f);
+
+            if (!EnsureRuntimeDownloads(
+                manifestPath,
+                exeDir,
+                [&](const wchar_t* status, const wchar_t* detail, float progress) {
+                    RenderPreparationProgress(downloadRenderer, downloadState, status, detail, progress);
+                })) {
+                WriteLog(L"Runtime download/bootstrap failed");
+                RenderPreparationProgress(
+                    downloadRenderer,
+                    downloadState,
+                    L"Download failed",
+                    L"Could not prepare Minecraft files",
+                    1.0f);
+                SleepWithAuthUi(downloadRenderer, downloadState, 3500);
+                return E_FAIL;
+            }
+
+            SleepWithAuthUi(downloadRenderer, downloadState, 250);
+        }
+
         const std::wstring localJreDir = exeDir + L"\\jre";
         const std::wstring packageJreDir = packageDir + L"\\jre";
         const std::wstring jreDir =
@@ -2963,16 +3482,10 @@ public:
                 : localNativesDir;
         const std::wstring minecraftVersion = kMinecraftVersionW;
         const std::wstring packageRuntimeDir = packageDir + L"\\runtime";
-        const std::wstring classpathGameDir =
-            (exeDir != packageDir && GetFileAttributesW((packageRuntimeDir + L"\\libraries").c_str()) != INVALID_FILE_ATTRIBUTES)
-                ? packageRuntimeDir
-                : gameDir;
-        const std::wstring bundledModsDir =
-            (exeDir != packageDir && GetFileAttributesW((packageRuntimeDir + L"\\bundled-mods").c_str()) != INVALID_FILE_ATTRIBUTES)
-                ? packageRuntimeDir + L"\\bundled-mods"
-                : gameDir + L"\\mods";
+        const std::wstring packagedLibrariesDir = packageRuntimeDir + L"\\libraries";
+        const std::wstring bundledModsDir = gameDir + L"\\mods";
         const std::wstring userModsDir = gameDir + L"\\user-mods";
-        const std::wstring clientJar = classpathGameDir + L"\\versions\\" + minecraftVersion + L"\\" + minecraftVersion + L".jar";
+        const std::wstring clientJar = gameDir + L"\\versions\\" + minecraftVersion + L"\\" + minecraftVersion + L".jar";
         const std::wstring argsPath = exeDir + L"\\java_args.txt";
         const std::wstring javaLog = exeDir + L"\\java_output.log";
 
@@ -2982,7 +3495,8 @@ public:
         WriteLogF(L"local jre release stamp: %s", FileStamp(localJreDir + L"\\release").c_str());
         WriteLogF(L"package jre release stamp: %s", FileStamp(packageJreDir + L"\\release").c_str());
         WriteLogF(L"nativesDir: %s", nativesDir.c_str());
-        WriteLogF(L"classpathGameDir: %s", classpathGameDir.c_str());
+        WriteLogF(L"packagedLibrariesDir: %s", packagedLibrariesDir.c_str());
+        WriteLogF(L"downloadedLibrariesDir: %s", (gameDir + L"\\libraries").c_str());
         WriteLogF(L"bundledModsDir: %s", bundledModsDir.c_str());
         WriteLogF(L"userModsDir: %s", userModsDir.c_str());
         WriteLogF(L"java.exe  exists=%d", GetFileAttributesW(javaExe.c_str()) != INVALID_FILE_ATTRIBUTES);
@@ -2990,7 +3504,8 @@ public:
         WriteLogF(L"clientJar exists=%d", GetFileAttributesW(clientJar.c_str()) != INVALID_FILE_ATTRIBUTES);
 
         std::vector<std::wstring> jars;
-        CollectJars(classpathGameDir + L"\\libraries", jars);
+        CollectJars(packagedLibrariesDir, jars);
+        CollectJars(gameDir + L"\\libraries", jars);
         jars.push_back(clientJar);
         WriteLogF(L"JAR count: %zu", jars.size());
 

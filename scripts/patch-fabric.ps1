@@ -39,23 +39,13 @@ if ($LASTEXITCODE -ne 0) { throw "JAR extract failed" }
 Pop-Location
 
 Write-Host "Overlaying patched classes..."
-$classFiles = @(
-    "net\fabricmc\loader\impl\util\LoaderUtil.class",
-    "net\fabricmc\loader\impl\util\FileSystemUtil.class",
-    "net\fabricmc\loader\impl\util\FileSystemUtil`$FileSystemDelegate.class",
-    "net\fabricmc\loader\impl\lib\tinyremapper\FileSystemReference.class",
-    "net\fabricmc\loader\impl\lib\tinyremapper\OutputConsumerPath.class",
-    "net\fabricmc\loader\impl\lib\tinyremapper\OutputConsumerPath`$Builder.class",
-    "net\fabricmc\loader\impl\lib\tinyremapper\OutputConsumerPath`$ResourceRemapper.class",
-    "net\fabricmc\loader\impl\launch\FabricLauncherBase.class",
-    "net\fabricmc\loader\impl\launch\FabricLauncherBase`$1.class"
-)
+$classFiles = Get-ChildItem -LiteralPath $classesTmp -Recurse -Filter "*.class"
 foreach ($classFile in $classFiles) {
-    $src = Join-Path $classesTmp $classFile
-    $dst = Join-Path $jarTmp $classFile
+    $relativePath = $classFile.FullName.Substring($classesTmp.Length).TrimStart('\', '/')
+    $dst = Join-Path $jarTmp $relativePath
     New-Item -ItemType Directory -Force -Path (Split-Path $dst -Parent) | Out-Null
-    Copy-Item -LiteralPath $src -Destination $dst -Force
-    Write-Host "  injected $($classFile.Replace('\', '/'))"
+    Copy-Item -LiteralPath $classFile.FullName -Destination $dst -Force
+    Write-Host "  injected $($relativePath.Replace('\', '/'))"
 }
 
 Write-Host "Stripping JAR signature..."
@@ -86,4 +76,4 @@ if ($LASTEXITCODE -ne 0) { throw "JAR repack failed" }
 Move-Item -LiteralPath $patchedLoader -Destination $loader -Force
 
 Write-Host "Done - fabric-loader-$loaderVersion.jar patched"
-Write-Host "Classes injected: LoaderUtil, FileSystemUtil, TinyRemapper FileSystemReference, OutputConsumerPath, FabricLauncherBase"
+Write-Host "Classes injected from compiled patch output: $($classFiles.Count)"
