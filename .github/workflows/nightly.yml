@@ -1,0 +1,134 @@
+name: Nightly build
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/nightly.yml"
+      - "MC.Xbox/**"
+      - "glfw_shim/**"
+      - "compat_mod/**"
+      - "patch/**"
+      - "scripts/**"
+      - "log_configs/**"
+      - "mesa-runtime/**"
+      - "xboxone-runtime/**"
+      - "build.ps1"
+      - "xbox_security.properties"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-build
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and publish nightly
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: microsoft
+          java-version: "21"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Python dependencies
+        shell: powershell
+        run: python -m pip install --upgrade pip pillow
+
+      - name: Clean generated outputs
+        shell: powershell
+        run: .\scripts\clean.ps1 -Apply
+
+      - name: Prepare build cache
+        shell: powershell
+        run: .\scripts\prepare-ci-cache.ps1
+
+      - name: Build APPX
+        shell: powershell
+        run: .\build.ps1 -SkipStopAppProcesses
+
+      - name: Stage nightly asset
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item output\BanditLauncher_1.0.0.0.appx dist\BanditLauncher-nightly.appx -Force
+          $hash = Get-FileHash dist\BanditLauncher-nightly.appx -Algorithm SHA256
+          "$($hash.Hash.ToLowerInvariant())  BanditLauncher-nightly.appx" | Set-Content -Path dist\BanditLauncher-nightly.sha256 -Encoding ascii
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BanditLauncher-nightly
+          path: |
+            dist/BanditLauncher-nightly.appx
+            dist/BanditLauncher-nightly.sha256
+          if-no-files-found: error
+
+      - name: Move nightly tag
+        shell: powershell
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly $env:GITHUB_SHA
+          git push --force origin refs/tags/nightly
+
+      - name: Publish nightly release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repo = $env:GITHUB_REPOSITORY
+          $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $notes = @"
+          Automated nightly build from $shortSha.
+
+          Commit: $env:GITHUB_SHA
+          Workflow run: $runUrl
+          "@
+
+          $releaseJson = gh api "repos/$repo/releases/tags/nightly" 2>$null
+          $releaseExists = $LASTEXITCODE -eq 0
+
+          if ($releaseExists) {
+            $release = $releaseJson | ConvertFrom-Json
+            gh api -X PATCH "repos/$repo/releases/$($release.id)" `
+              -f tag_name=nightly `
+              -f target_commitish=$env:GITHUB_SHA `
+              -f name=nightly `
+              -f body="$notes" `
+              -F prerelease=true | Out-Null
+
+            $assets = gh api "repos/$repo/releases/$($release.id)/assets" | ConvertFrom-Json
+            foreach ($asset in @($assets)) {
+              if ($asset.name -eq "BanditLauncher-nightly.appx" -or $asset.name -eq "BanditLauncher-nightly.sha256") {
+                gh api -X DELETE "repos/$repo/releases/assets/$($asset.id)" | Out-Null
+              }
+            }
+          } else {
+            gh api -X POST "repos/$repo/releases" `
+              -f tag_name=nightly `
+              -f target_commitish=$env:GITHUB_SHA `
+              -f name=nightly `
+              -f body="$notes" `
+              -F prerelease=true | Out-Null
+          }
+
+          gh release upload nightly dist\BanditLauncher-nightly.appx dist\BanditLauncher-nightly.sha256 --clobber
