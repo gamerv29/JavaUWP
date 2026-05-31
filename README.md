@@ -1,12 +1,12 @@
 # Bandit Launcher
 
-`Bandit Launcher` is an experimental Minecraft Java Edition launcher for Xbox Developer Mode UWP.
+`Bandit Launcher` is an experimental Minecraft Java Edition launcher for Xbox Developer Mode UWP. Current builds are pre-release quality: playable, but not a finished main release.
 
 The app signs in with Microsoft, verifies Minecraft Java ownership, prepares the local runtime, then starts Fabric/Minecraft inside the UWP process. Rendering and input still use a custom GLFW layer backed by UWP `CoreWindow`; Series consoles use the Mesa EGL/D3D12 runtime, while Xbox One can use a separate MobileGlues/ANGLE-style runtime when packaged.
 
-## Current state
+## Current State
 
-The project is usable for active launcher development:
+The project is usable for active launcher development and pre-release testing:
 
 - Minecraft 1.21.11 with Fabric Loader 0.19.2 boots in Xbox Developer Mode.
 - Dynamic Microsoft device-code auth works and persists the session in the UWP Credential Locker.
@@ -27,7 +27,22 @@ The project is usable for active launcher development:
 
 Expect rough edges. This is still a development launcher, not a finished release product.
 
-## Repo layout
+## Nightly And Pre-Release Builds
+
+Nightly builds are highly experimental snapshots of current development work. They are not full game releases, and support is not provided for nightly builds.
+
+The project is currently pre-released because it is in a playable state, but it is not ready for a main release. Xbox Series consoles are the primary target right now. Xbox One support is spotty at best.
+
+After installing a pre-release or nightly build, open the Mods page, go to the Recommended section, and install at least:
+
+- Sodium
+- Controllify
+
+These are strongly recommended for performance and controller support.
+
+Redistribution of the APPX package is not permitted without prior written permission, as described in [LICENSE](LICENSE). Video tutorials or other public install guides for nightly or pre-release builds are not permitted until the full release.
+
+## Repo Layout
 
 - `MC.Xbox/`
   UWP host and launcher app. It handles Microsoft auth, the launcher menu, runtime preparation, JVM startup, `CoreWindow` publishing for EGL, and Fabric launch.
@@ -44,7 +59,7 @@ Expect rough edges. This is still a development launcher, not a finished release
 - `build.ps1`
   Main build and package script.
 
-## Build overview
+## Build Overview
 
 Read [docs/BUILDING.md](docs/BUILDING.md) for the complete setup. The short version is:
 
@@ -58,7 +73,7 @@ The build script compiles the UWP host, builds the GLFW shim, builds the compati
 
 Generated files live under `staging` and `output`. They are ignored by git.
 
-## Local inputs
+## Local Inputs
 
 You need to provide your own legal game and runtime inputs. This repo does not include:
 
@@ -72,7 +87,7 @@ You need to provide your own legal game and runtime inputs. This repo does not i
 
 The Mesa UWP runtime DLLs needed by the build are tracked in `mesa-runtime/`.
 
-## How it works
+## How It Works
 
 1. `MC.Xbox.exe` starts as a UWP app.
 2. The launcher checks for a saved Microsoft refresh token.
@@ -90,13 +105,15 @@ The Mesa UWP runtime DLLs needed by the build are tracked in `mesa-runtime/`.
 
 The main launcher work is around Microsoft auth, ownership verification, UWP package identity, Xbox sandbox paths, packaged app file access, native library loading, GLFW behavior, input, and Fabric remapping.
 
-## Status and limits
+## Status And Limits
 
 Known limits include:
 
 - Xbox Developer Mode is the only supported target.
 - Retail mode is not supported.
+- Xbox Series consoles are the primary target. Xbox One support is experimental and currently unreliable.
 - The Mods page is an early Modrinth integration. It installs Fabric mods for the configured Minecraft version, but broad mod compatibility still depends on each mod working inside the Xbox/UWP runtime.
+- Sodium and Controllify should be installed from the Recommended section for the best current pre-release experience.
 - First launch can take a while because official game libraries and asset objects are downloaded after sign-in. Missing/stale files are downloaded with limited parallelism.
 - Path handling is still the most sensitive area.
 - Some Java platform diagnostics can still warn or fail because the sandbox does not look like desktop Windows.
@@ -121,8 +138,10 @@ Then apply when the preview looks right:
 .\scripts\clean.ps1 -Apply
 ```
 
-## License and ownership
+## License And Ownership
 
 Original project code in this repository is available under the custom terms in [LICENSE](LICENSE). Use is allowed with credit. Redistribution requires prior written permission from veroxsity / BanditVault.
+
+Redistribution of generated APPX packages is not permitted without prior written permission. Public install tutorials or videos for nightly or pre-release builds are not permitted until the full release.
 
 Minecraft, Fabric, Mojang assets, Mesa, LWJGL, Java, and other third-party components remain under their own licenses and terms.

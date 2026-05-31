@@ -17,6 +17,14 @@ In short:
 - Redistribution requires prior written permission from veroxsity / BanditVault.
 - Third party components keep their own licenses and terms.
 
+## Pre-Release And Nightly Packages
+
+Generated APPX packages, including nightly and pre-release packages, may not be redistributed, mirrored, re-uploaded, or otherwise shared without prior written permission from veroxsity / BanditVault.
+
+Nightly and pre-release packages are experimental testing builds. They are not full releases, and support is not provided for them.
+
+Public video tutorials, public install guides, or similar public walkthroughs for nightly or pre-release APPX packages are not permitted until the full release.
+
 ## Local files
 
 The build creates or uses local files that should stay out of git:

@@ -14,6 +14,7 @@ output\BanditLauncher_1.0.0.0.appx
 - Visual Studio or Visual Studio Build Tools with the MSVC x64 C++ tools.
 - Windows 10 or Windows 11 SDK.
 - JDK 21 or newer. Set `JAVA_HOME` if auto detection does not find it.
+- JDK 25 is used by the nightly workflow and is recommended for release-equivalent package builds.
 - Python 3 with Pillow.
 - Desktop install of Git `https://git-scm.com/install/windows`
 - Fabric installer JAR at `staging\cache\tools\fabric-installer.jar`.
@@ -46,6 +47,8 @@ The main build accepts temporary overrides:
 ```
 
 These values are passed into setup helpers and into the generated host header used by `MC.Xbox\App.cpp`.
+
+The `JavaRelease` value is the minimum Java version the scripts search for. Nightly CI currently installs JDK 25 so the Java security patch is built against the same runtime family used by current test packages.
 
 For a real version bump, update:
 
@@ -118,6 +121,14 @@ Create the local cache folders and place the Fabric installer here:
 ```text
 staging\cache\tools\fabric-installer.jar
 ```
+
+For CI-style setup on a clean machine, the helper below downloads the public Mojang/Fabric metadata, client libraries, Windows native DLLs, Fabric installer, asset index, and generates the local Fabric remapped client jar:
+
+```powershell
+.\scripts\prepare-ci-cache.ps1
+```
+
+The helper does not make the remapped client jar part of the repository or release package. It stays in ignored local cache paths under `staging\cache`.
 
 Download the Minecraft client libraries for the local build cache:
 
@@ -192,6 +203,10 @@ JSON files, asset indexes, asset objects, or Fabric remapped jars. During build,
 Mojang and Fabric metadata. During launch, after ownership verification,
 `MC.Xbox.exe` verifies the manifest entries under `LocalState` and downloads any
 missing or stale files.
+
+Do not redistribute generated APPX packages without prior written permission. Nightly and pre-release APPX packages are for testing only, are unsupported, and are not full game releases.
+
+Public video tutorials or other install guides for nightly or pre-release APPX packages are not permitted until the full release.
 
 Downloaded runtime files land under:
 
@@ -275,6 +290,14 @@ Run:
 ```powershell
 .\build.ps1
 ```
+
+## Nightly Workflow
+
+The GitHub Actions workflow in `.github/workflows/nightly.yml` builds and publishes the moving `nightly` release when relevant source, build, runtime, or workflow files change on `main`. Documentation-only changes such as README updates do not trigger a nightly package.
+
+The workflow publishes `BanditLauncher-nightly.appx` and `BanditLauncher-nightly.sha256` to the `nightly` release, and force-moves the `nightly` tag to the commit that produced the package.
+
+Nightly releases are experimental, unsupported, and not full game releases. The generated release notes also remind users that APPX redistribution and public install tutorials for nightly builds are not permitted before the full release.
 
 Useful options:
 
