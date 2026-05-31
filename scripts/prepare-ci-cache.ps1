@@ -70,6 +70,16 @@ function Expand-NativeJar {
     return $extracted
 }
 
+function ConvertTo-QuotedProcessArgument {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    if ($Value -notmatch '[\s"]') {
+        return $Value
+    }
+
+    return '"' + $Value.Replace('"', '\"') + '"'
+}
+
 New-Item -ItemType Directory -Force -Path $gameDir, $assetsDir, $nativesDir, $toolsDir, $notesDir | Out-Null
 
 Write-Host "=== Downloading Minecraft libraries ==="
@@ -190,13 +200,18 @@ if (-not (Test-Path $remappedJar)) {
         "--versionType", "release"
     )
 
-    Push-Location $gameDir
-    try {
-        & $javaExe @javaArgs 1> $remapStdoutLog 2> $remapStderrLog
-        $fabricExitCode = $LASTEXITCODE
-    } finally {
-        Pop-Location
-    }
+    $javaArgumentLine = ($javaArgs | ForEach-Object { ConvertTo-QuotedProcessArgument ([string]$_) }) -join " "
+    Remove-Item -LiteralPath $remapStdoutLog, $remapStderrLog -Force -ErrorAction SilentlyContinue
+    $javaProcess = Start-Process `
+        -FilePath $javaExe `
+        -ArgumentList $javaArgumentLine `
+        -WorkingDirectory $gameDir `
+        -NoNewWindow `
+        -Wait `
+        -PassThru `
+        -RedirectStandardOutput $remapStdoutLog `
+        -RedirectStandardError $remapStderrLog
+    $fabricExitCode = $javaProcess.ExitCode
 
     $remapOutput = @()
     if (Test-Path $remapStdoutLog) {
