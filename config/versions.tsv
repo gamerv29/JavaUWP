@@ -5,6 +5,6 @@ minecraftVersion	displayName	loader	loaderVersion	javaRuntime	supportLevel	notes
 1.20.4	1.20.4 Fabric	fabric	0.19.2	java21	testing	Uses Java 21 for mods that reject newer JVM majors
 1.20.1	1.20.1 Forge	forge	selected	current	experimental	Provider not implemented yet
 1.19.2	1.19.2 Fabric	fabric	0.14.25	current	testing	Profile/catalog target only until per-version launch lands
-1.16.5	1.16.5 Fabric	fabric	0.14.25	current	testing	Needs runtime validation
+1.16.5	1.16.5 Fabric	fabric	0.14.25	java21	testing	Legacy GL path under validation
 1.12.2	1.12.2 Forge	forge	selected	legacy	experimental	Legacy provider not implemented yet
 1.12.2	1.12.2 Vanilla	vanilla	none	legacy	experimental	Legacy provider not implemented yet

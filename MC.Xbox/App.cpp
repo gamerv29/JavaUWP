@@ -7626,6 +7626,10 @@ public:
         WriteLogF(L"gameDir   exists=%d", GetFileAttributesW(gameDir.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"clientJar exists=%d", GetFileAttributesW(clientJar.c_str()) != INVALID_FILE_ATTRIBUTES);
 
+        const bool legacyOpenGlContext = CompareVersionNumbers(w2a(minecraftVersion), "1.17") < 0;
+        SetEnvironmentVariableW(L"MC_LEGACY_OPENGL_CONTEXT", legacyOpenGlContext ? L"1" : L"0");
+        WriteLogF(L"legacy OpenGL compatibility context=%d", legacyOpenGlContext ? 1 : 0);
+
         std::vector<std::wstring> jars;
         if (!versionInfo.loaderJar.empty()) {
             jars.push_back(versionInfo.loaderJar);

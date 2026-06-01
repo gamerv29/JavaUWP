@@ -179,6 +179,7 @@ typedef struct { unsigned char buttons[15]; float axes[6]; } GLFWgamepadstate;
 #define GLFW_RESIZABLE 0x00020003
 #define GLFW_HOVERED   0x0002000B
 #define GLFW_OPENGL_CORE_PROFILE   0x00032001
+#define GLFW_OPENGL_COMPAT_PROFILE 0x00032002
 #define GLFW_NATIVE_CONTEXT_API    0x00036001
 #define GLFW_EGL_CONTEXT_API       0x00036002
 #define GLFW_CURSOR          0x00033001
@@ -254,6 +255,7 @@ typedef uint32_t EGLenum;
 #define EGL_CONTEXT_MINOR_VERSION_KHR 0x30FB
 #define EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR 0x30FD
 #define EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR 0x00000001
+#define EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR 0x00000002
 
 typedef EGLDisplay (WINAPI* PFN_eglGetDisplay)(EGLNativeDisplayType);
 typedef EGLDisplay (WINAPI* PFN_eglGetPlatformDisplay)(EGLenum, void*, const EGLint*);
@@ -439,6 +441,16 @@ static void GetGraphicsRuntimeName(wchar_t* out, int cch) {
         _wcsicmp(out, L"seriess") == 0 || _wcsicmp(out, L"auto") == 0) {
         swprintf_s(out, cch, L"mesa");
     }
+}
+
+static bool EnvFlagEnabled(const wchar_t* name) {
+    wchar_t value[32] = {};
+    DWORD len = GetEnvironmentVariableW(name, value, ARRAYSIZE(value));
+    if (len == 0 || len >= ARRAYSIZE(value)) return false;
+    return _wcsicmp(value, L"1") == 0 ||
+        _wcsicmp(value, L"true") == 0 ||
+        _wcsicmp(value, L"yes") == 0 ||
+        _wcsicmp(value, L"on") == 0;
 }
 
 static bool DirectoryExists(const wchar_t* path) {
@@ -1282,20 +1294,28 @@ static bool CreateEglContext() {
         return false;
     }
 
+    const bool legacyOpenGlContext = EnvFlagEnabled(L"MC_LEGACY_OPENGL_CONTEXT");
     const EGLint desktopContextAttrs[] = {
         EGL_CONTEXT_MAJOR_VERSION_KHR, 3,
         EGL_CONTEXT_MINOR_VERSION_KHR, 2,
         EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
         EGL_NONE
     };
+    const EGLint legacyDesktopContextAttrs[] = {
+        EGL_CONTEXT_MAJOR_VERSION_KHR, 3,
+        EGL_CONTEXT_MINOR_VERSION_KHR, 2,
+        EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR,
+        EGL_NONE
+    };
     const EGLint glesContextAttrs[] = {
         EGL_CONTEXT_CLIENT_VERSION, 3,
         EGL_NONE
     };
-    const EGLint* contextAttrs = g_graphicsRuntimeUsesGles ? glesContextAttrs : desktopContextAttrs;
+    const EGLint* contextAttrs = g_graphicsRuntimeUsesGles ? glesContextAttrs : (legacyOpenGlContext ? legacyDesktopContextAttrs : desktopContextAttrs);
+    ShimLog("OpenGL context request: %s", g_graphicsRuntimeUsesGles ? "GLES3" : (legacyOpenGlContext ? "3.2 compatibility" : "3.2 core"));
     g_eglContext = p_eglCreateContext(g_eglDisplay, g_eglConfig, EGL_NO_CONTEXT, contextAttrs);
     if (g_eglContext == EGL_NO_CONTEXT) {
-        ReportEglError(g_graphicsRuntimeUsesGles ? "eglCreateContext(GLES3)" : "eglCreateContext(3.2 core)");
+        ReportEglError(g_graphicsRuntimeUsesGles ? "eglCreateContext(GLES3)" : (legacyOpenGlContext ? "eglCreateContext(3.2 compatibility)" : "eglCreateContext(3.2 core)"));
         g_eglContext = p_eglCreateContext(g_eglDisplay, g_eglConfig, EGL_NO_CONTEXT, nullptr);
     }
     if (g_eglContext == EGL_NO_CONTEXT) {
@@ -1480,7 +1500,7 @@ extern "C" __declspec(dllexport) int glfwGetWindowAttrib(GLFWwindow*, int a) {
     case GLFW_CONTEXT_VERSION_MINOR:
         return 2;
     case GLFW_OPENGL_PROFILE:
-        return GLFW_OPENGL_CORE_PROFILE;
+        return EnvFlagEnabled(L"MC_LEGACY_OPENGL_CONTEXT") ? GLFW_OPENGL_COMPAT_PROFILE : GLFW_OPENGL_CORE_PROFILE;
     case GLFW_CONTEXT_CREATION_API:
         return GLFW_EGL_CONTEXT_API;
     default:
