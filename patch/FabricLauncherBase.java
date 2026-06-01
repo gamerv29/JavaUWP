@@ -30,7 +30,7 @@ public abstract class FabricLauncherBase implements FabricLauncher {
     }
 
     @Override
-    public final boolean isDevelopment() {
+    public boolean isDevelopment() {
         return IS_DEVELOPMENT;
     }
 

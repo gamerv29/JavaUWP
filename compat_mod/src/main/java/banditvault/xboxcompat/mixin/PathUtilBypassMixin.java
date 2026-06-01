@@ -1,7 +1,7 @@
 package banditvault.xboxcompat.mixin;
 
+import banditvault.xboxcompat.PathUtilResolver;
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import net.minecraft.class_4239;
 import org.spongepowered.asm.mixin.Mixin;
@@ -18,6 +18,6 @@ public abstract class PathUtilBypassMixin {
      */
     @Overwrite
     public static void method_47525(Path path) throws IOException {
-        Files.createDirectories(path);
+        PathUtilResolver.createDirectories(path);
     }
 }

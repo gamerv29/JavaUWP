@@ -46,7 +46,7 @@ if ($hasTinyRemapperOutputConsumer) {
     Write-Host "TinyRemapper OutputConsumerPath is not bundled in fabric-loader-$loaderVersion; skipping that patch."
 }
 
-& (Join-Path $java "bin\javac.exe") -cp $loader -d $classesTmp $patchSources
+& (Join-Path $java "bin\javac.exe") --release 21 -cp $loader -d $classesTmp $patchSources
 if ($LASTEXITCODE -ne 0) { throw "Compile failed" }
 
 # Repack a fresh JAR instead of updating in place. Repeated ZipArchive updates

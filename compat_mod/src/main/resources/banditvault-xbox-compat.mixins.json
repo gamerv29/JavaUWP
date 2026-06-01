@@ -8,6 +8,7 @@
     "PathUtilBypassMixin",
     "SystemDetailsOshiBypassMixin",
     "WorldLoadProgressTrackerMixin",
+    "ZipFsBypass121Mixin",
     "ZipFsBypassMixin"
   ],
   "injectors": {

@@ -1,18 +1,32 @@
+param(
+    [string]$MinecraftVersion,
+    [string]$FabricLoaderVersion,
+    [string]$AssetIndex
+)
+
 # Prepare the ignored build cache needed by build.ps1 on a clean CI runner.
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+
+if ($MinecraftVersion) { $env:MC_VERSION = $MinecraftVersion }
+if ($FabricLoaderVersion) { $env:FABRIC_LOADER_VERSION = $FabricLoaderVersion }
+if ($AssetIndex) { $env:MC_ASSET_INDEX = $AssetIndex }
 
 . (Join-Path $PSScriptRoot "common.ps1")
 
 $root = Resolve-RepoRoot
 $gameDir = Get-ConfigPath "GameDir"
 $assetsDir = Get-ConfigPath "AssetsDir"
-$nativesDir = Get-ConfigPath "NativesDir"
+$version = if ($MinecraftVersion) { $MinecraftVersion } else { $ProjectConfig.MinecraftVersion }
+$loaderVersion = if ($FabricLoaderVersion) { $FabricLoaderVersion } else { $ProjectConfig.FabricLoaderVersion }
+$nativesDir = if ($MinecraftVersion -and $MinecraftVersion -ne $ProjectConfig.MinecraftVersion) {
+    Join-Path (Get-ConfigPath "CacheDir") ("natives-" + ($MinecraftVersion -replace '[^A-Za-z0-9_.-]', '_'))
+} else {
+    Get-ConfigPath "NativesDir"
+}
 $toolsDir = Get-ConfigPath "ToolsDir"
 $notesDir = Get-ConfigPath "NotesDir"
-$version = $ProjectConfig.MinecraftVersion
-$assetIndex = $ProjectConfig.MinecraftAssetIndex
-$loaderVersion = $ProjectConfig.FabricLoaderVersion
+$assetIndex = if ($AssetIndex) { $AssetIndex } else { "" }
 $javaHome = Resolve-JavaHome
 $javaExe = Join-Path $javaHome "bin\java.exe"
 
@@ -80,12 +94,44 @@ function ConvertTo-QuotedProcessArgument {
     return '"' + $Value.Replace('"', '\"') + '"'
 }
 
+function Convert-MavenNameToPath {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $parts = $Name.Split(":")
+    if ($parts.Length -lt 3) {
+        throw "Unsupported Maven coordinate: $Name"
+    }
+
+    $group = $parts[0].Replace(".", "\")
+    $artifact = $parts[1]
+    $versionPart = $parts[2]
+    $classifier = if ($parts.Length -ge 4) { "-$($parts[3])" } else { "" }
+    return "$group\$artifact\$versionPart\$artifact-$versionPart$classifier.jar"
+}
+
+function Add-LibraryJar {
+    param(
+        [System.Collections.Generic.List[string]]$Jars,
+        [Parameter(Mandatory = $true)][string]$RelativePath
+    )
+
+    $jarPath = Join-Path $gameDir ("libraries\" + $RelativePath.Replace('/', '\'))
+    if (Test-Path $jarPath) {
+        $Jars.Add($jarPath)
+    } else {
+        Write-Warning "Classpath library missing: $jarPath"
+    }
+}
+
 New-Item -ItemType Directory -Force -Path $gameDir, $assetsDir, $nativesDir, $toolsDir, $notesDir | Out-Null
 
 Write-Host "=== Downloading Minecraft libraries ==="
 & (Join-Path $root "scripts\download-libs.ps1")
 
 $versionJson = Get-MinecraftVersionJson
+if (-not $assetIndex) {
+    $assetIndex = $versionJson.assetIndex.id
+}
 
 Write-Host "=== Downloading Minecraft native DLLs ==="
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -154,6 +200,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "Fabric installer failed."
 }
 
+Write-Host "=== Patching Fabric loader $loaderVersion for cache preparation ==="
+& (Join-Path $root "scripts\patch-fabric.ps1") -LoaderVersion $loaderVersion
+if ($LASTEXITCODE -ne 0) {
+    throw "Fabric loader patch failed."
+}
+
 Write-Host "=== Downloading asset index ==="
 $indexDir = Join-Path $assetsDir "indexes"
 New-Item -ItemType Directory -Force -Path $indexDir | Out-Null
@@ -181,19 +233,33 @@ if (-not (Test-Path $remappedJar)) {
         throw "Client jar missing at $clientJar."
     }
 
-    $jars = @()
-    Get-ChildItem -Recurse (Join-Path $gameDir "libraries") -Filter "*.jar" | ForEach-Object {
-        $jars += $_.FullName
+    $jars = [System.Collections.Generic.List[string]]::new()
+    foreach ($library in $versionJson.libraries) {
+        if ($library.downloads -and $library.downloads.artifact) {
+            Add-LibraryJar -Jars $jars -RelativePath ([string]$library.downloads.artifact.path)
+        }
+    }
+
+    $fabricVersionJsonPath = Join-Path $gameDir "versions\fabric-loader-$loaderVersion-$version\fabric-loader-$loaderVersion-$version.json"
+    if (-not (Test-Path $fabricVersionJsonPath)) {
+        throw "Fabric version JSON missing at $fabricVersionJsonPath."
+    }
+    $fabricVersionJson = Get-Content -Raw -Path $fabricVersionJsonPath | ConvertFrom-Json
+    foreach ($library in $fabricVersionJson.libraries) {
+        Add-LibraryJar -Jars $jars -RelativePath (Convert-MavenNameToPath ([string]$library.name))
     }
     $jars += $clientJar
     $classpath = $jars -join ";"
     $remapLog = Join-Path $notesDir "fabric-remap.log"
     $remapStdoutLog = Join-Path $notesDir "fabric-remap.stdout.log"
     $remapStderrLog = Join-Path $notesDir "fabric-remap.stderr.log"
+    $emptyModsDir = Join-Path $gameDir ".fabric\empty-mods-$version-$loaderVersion"
+    New-Item -ItemType Directory -Force -Path $emptyModsDir | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $gameDir "logs") | Out-Null
 
     $javaArgs = @(
         "-Dfabric.gameJarPath=$clientJar",
+        "-Dfabric.modsFolder=$emptyModsDir",
         "-Djava.library.path=$nativesDir",
         "-Dorg.lwjgl.librarypath=$nativesDir",
         "-Duser.dir=$gameDir",

@@ -63,12 +63,15 @@ public abstract class MinecraftClientProbeMixin {
         }
 
         Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
-        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
-            XboxCompatLog.logException(
-                "Uncaught exception on thread=" + thread.getName(),
-                throwable);
-            if (previous != null) {
-                previous.uncaughtException(thread, throwable);
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+            @Override
+            public void uncaughtException(Thread thread, Throwable throwable) {
+                XboxCompatLog.logException(
+                    "Uncaught exception on thread=" + thread.getName(),
+                    throwable);
+                if (previous != null) {
+                    previous.uncaughtException(thread, throwable);
+                }
             }
         });
         banditvault$uncaughtHandlerInstalled = true;

@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.net.Socket;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.OpenOption;
@@ -11,6 +13,8 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.time.LocalTime;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
 
 
 
@@ -38,20 +42,20 @@ public final class XboxCompatLog {
     public static void probeNetwork() {
         log("network probe start");
         try {
-            var ctx = javax.net.ssl.SSLContext.getDefault();
+            SSLContext ctx = SSLContext.getDefault();
             log("SSLContext default ok: " + ctx.getProtocol());
         } catch (Throwable t) {
             logException("SSLContext init failed", t);
         }
-        try (var s = new java.net.Socket()) {
+        try (Socket s = new Socket()) {
             s.connect(new java.net.InetSocketAddress("textures.minecraft.net", 443), 5000);
             log("tcp connect ok");
         } catch (Throwable t) {
             logException("tcp connect failed", t);
         }
         try {
-            var url = java.net.URI.create("https://textures.minecraft.net/").toURL();
-            var c = (javax.net.ssl.HttpsURLConnection) url.openConnection();
+            URL url = java.net.URI.create("https://textures.minecraft.net/").toURL();
+            HttpsURLConnection c = (HttpsURLConnection) url.openConnection();
             c.setConnectTimeout(5000);
             c.setReadTimeout(5000);
             log("https response: " + c.getResponseCode());
@@ -68,6 +72,14 @@ public final class XboxCompatLog {
                 throwable.printStackTrace(writer);
             }
         }
-        log(buffer.toString().stripTrailing());
+        log(trimTrailing(buffer.toString()));
+    }
+
+    private static String trimTrailing(String value) {
+        int end = value.length();
+        while (end > 0 && Character.isWhitespace(value.charAt(end - 1))) {
+            end--;
+        }
+        return value.substring(0, end);
     }
 }

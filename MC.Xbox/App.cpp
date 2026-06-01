@@ -994,6 +994,7 @@ static void CollectManifestLibraryJars(const std::wstring& manifestPath, const s
         for (wchar_t& c : rel) c = static_cast<wchar_t>(towlower(c));
         if (rel.rfind(L"game/libraries/", 0) != 0) continue;
         if (rel.size() < 4 || rel.compare(rel.size() - 4, 4, L".jar") != 0) continue;
+        if (rel.find(L"-natives-") != std::wstring::npos) continue;
         const std::wstring abs = JoinRuntimeRelativePath(runtimeRoot, e.relativePath);
         if (!abs.empty()) jars.push_back(abs);
     }
@@ -2276,6 +2277,173 @@ static bool IsBlockedModFile(const std::wstring& fileName) {
     return FindBlockedModFile(fileName) != nullptr;
 }
 
+static std::vector<int> ParseVersionNumbers(const std::string& value) {
+    std::vector<int> parts;
+    size_t i = 0;
+    while (i < value.size()) {
+        while (i < value.size() && (value[i] < '0' || value[i] > '9')) ++i;
+        if (i >= value.size()) break;
+        int n = 0;
+        while (i < value.size() && value[i] >= '0' && value[i] <= '9') {
+            n = (n * 10) + (value[i] - '0');
+            ++i;
+        }
+        parts.push_back(n);
+    }
+    return parts;
+}
+
+static int CompareVersionNumbers(const std::string& lhs, const std::string& rhs) {
+    std::vector<int> a = ParseVersionNumbers(lhs);
+    std::vector<int> b = ParseVersionNumbers(rhs);
+    const size_t n = (std::max)(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+        const int av = i < a.size() ? a[i] : 0;
+        const int bv = i < b.size() ? b[i] : 0;
+        if (av < bv) return -1;
+        if (av > bv) return 1;
+    }
+    return 0;
+}
+
+static std::vector<std::string> SplitConstraintAlternatives(const std::string& constraint) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    for (;;) {
+        const size_t pos = constraint.find("||", start);
+        std::string part = constraint.substr(start, pos == std::string::npos ? std::string::npos : pos - start);
+        while (!part.empty() && isspace(static_cast<unsigned char>(part.front()))) part.erase(part.begin());
+        while (!part.empty() && isspace(static_cast<unsigned char>(part.back()))) part.pop_back();
+        if (!part.empty()) out.push_back(part);
+        if (pos == std::string::npos) break;
+        start = pos + 2;
+    }
+    return out;
+}
+
+static bool SatisfiesVersionPredicatePart(const std::string& actual, std::string part) {
+    while (!part.empty() && isspace(static_cast<unsigned char>(part.front()))) part.erase(part.begin());
+    while (!part.empty() && isspace(static_cast<unsigned char>(part.back()))) part.pop_back();
+    if (part.empty() || part == "*") return true;
+
+    std::string op = "=";
+    size_t versionStart = 0;
+    if (part.rfind(">=", 0) == 0 || part.rfind("<=", 0) == 0 || part.rfind("==", 0) == 0) {
+        op = part.substr(0, 2);
+        versionStart = 2;
+    } else if (part[0] == '>' || part[0] == '<' || part[0] == '=') {
+        op = part.substr(0, 1);
+        versionStart = 1;
+    }
+
+    std::string expected = part.substr(versionStart);
+    while (!expected.empty() && isspace(static_cast<unsigned char>(expected.front()))) expected.erase(expected.begin());
+    if (expected.empty() || expected == "*") return true;
+
+    const int cmp = CompareVersionNumbers(actual, expected);
+    if (op == ">=") return cmp >= 0;
+    if (op == "<=") return cmp <= 0;
+    if (op == ">") return cmp > 0;
+    if (op == "<") return cmp < 0;
+    if (op == "=" || op == "==") return cmp == 0;
+
+    return true;
+}
+
+static bool SatisfiesVersionPredicate(const std::string& actual, const std::wstring& predicate) {
+    std::string constraint = w2a(predicate);
+    while (!constraint.empty() && isspace(static_cast<unsigned char>(constraint.front()))) constraint.erase(constraint.begin());
+    while (!constraint.empty() && isspace(static_cast<unsigned char>(constraint.back()))) constraint.pop_back();
+    if (constraint.empty() || constraint == "*") return true;
+
+    std::vector<std::string> alternatives = SplitConstraintAlternatives(constraint);
+    if (alternatives.empty()) alternatives.push_back(constraint);
+    for (const std::string& alternative : alternatives) {
+        std::stringstream ss(alternative);
+        std::string part;
+        bool ok = true;
+        bool sawPart = false;
+        while (ss >> part) {
+            sawPart = true;
+            if (!SatisfiesVersionPredicatePart(actual, part)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok && sawPart) return true;
+    }
+    return false;
+}
+
+static bool ReadZipTextFile(const std::wstring& zipPath, const char* entryName, std::wstring& out) {
+    out.clear();
+    std::ifstream in(zipPath, std::ios::binary);
+    if (!in) return false;
+    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (bytes.empty()) return false;
+
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_mem(&zip, bytes.data(), bytes.size(), 0)) return false;
+    const int idx = mz_zip_reader_locate_file(&zip, entryName, nullptr, 0);
+    if (idx < 0) {
+        mz_zip_reader_end(&zip);
+        return false;
+    }
+
+    size_t outSize = 0;
+    void* p = mz_zip_reader_extract_to_heap(&zip, static_cast<mz_uint>(idx), &outSize, 0);
+    mz_zip_reader_end(&zip);
+    if (!p) return false;
+
+    std::string text(static_cast<const char*>(p), static_cast<const char*>(p) + outSize);
+    mz_free(p);
+    out = a2w(text.c_str());
+    return true;
+}
+
+static bool ModJarMatchesFabricLoader(const std::wstring& jarPath, const std::string& loaderVersion, std::wstring& reason) {
+    using namespace winrt::Windows::Data::Json;
+    reason.clear();
+    if (loaderVersion.empty()) return true;
+
+    std::wstring fabricModJson;
+    if (!ReadZipTextFile(jarPath, "fabric.mod.json", fabricModJson)) {
+        return true;
+    }
+
+    try {
+        JsonObject root = JsonObject::Parse(winrt::hstring(fabricModJson.c_str()));
+        if (!root.HasKey(L"depends") || root.GetNamedValue(L"depends").ValueType() != JsonValueType::Object) {
+            return true;
+        }
+        JsonObject depends = root.GetNamedObject(L"depends");
+        if (!depends.HasKey(L"fabricloader")) return true;
+
+        const IJsonValue value = depends.GetNamedValue(L"fabricloader");
+        std::vector<std::wstring> predicates;
+        if (value.ValueType() == JsonValueType::String) {
+            predicates.push_back(depends.GetNamedString(L"fabricloader").c_str());
+        } else if (value.ValueType() == JsonValueType::Array) {
+            JsonArray arr = value.GetArray();
+            for (uint32_t i = 0; i < arr.Size(); ++i) {
+                if (arr.GetAt(i).ValueType() == JsonValueType::String) {
+                    predicates.push_back(arr.GetAt(i).GetString().c_str());
+                }
+            }
+        }
+
+        if (predicates.empty()) return true;
+        for (const std::wstring& predicate : predicates) {
+            if (SatisfiesVersionPredicate(loaderVersion, predicate)) return true;
+        }
+
+        reason = L"requires Fabric Loader " + predicates.front() + L", target has " + a2w(loaderVersion.c_str());
+        return false;
+    } catch (...) {
+        return true;
+    }
+}
+
 static int PurgeBlockedModsFromDir(const std::wstring& runtimeRoot, const std::wstring& modsDir) {
     int removed = 0;
     WIN32_FIND_DATAW fd = {};
@@ -2307,7 +2475,8 @@ static bool InstallModrinthProjectRecursive(
     const ModCard* topMeta,
     std::wstring& error,
     const std::string& gameVersion,
-    const std::string& loaderId) {
+    const std::string& loaderId,
+    const std::string& loaderVersion) {
     using namespace winrt::Windows::Data::Json;
     if (projectIdOrSlug.empty()) {
         error = L"Missing Modrinth project id";
@@ -2342,90 +2511,119 @@ static bool InstallModrinthProjectRecursive(
             return false;
         }
 
-        JsonObject version = nullptr;
+        std::vector<JsonObject> candidates;
         for (uint32_t i = 0; i < versionsArray.Size(); ++i) {
             auto value = versionsArray.GetAt(i);
             if (value.ValueType() != JsonValueType::Object) continue;
             JsonObject candidate = value.GetObject();
             if (JsonStringOrEmpty(candidate, L"version_type") == L"release") {
-                version = candidate;
-                break;
+                candidates.push_back(candidate);
             }
-            if (!version) version = candidate;
         }
-        if (!version) {
+        for (uint32_t i = 0; i < versionsArray.Size(); ++i) {
+            auto value = versionsArray.GetAt(i);
+            if (value.ValueType() != JsonValueType::Object) continue;
+            JsonObject candidate = value.GetObject();
+            if (JsonStringOrEmpty(candidate, L"version_type") != L"release") {
+                candidates.push_back(candidate);
+            }
+        }
+        if (candidates.empty()) {
             error = L"No installable Modrinth version was found";
             return false;
         }
 
-        if (version.HasKey(L"dependencies") &&
-            version.GetNamedValue(L"dependencies").ValueType() == JsonValueType::Array) {
-            JsonArray dependencies = version.GetNamedArray(L"dependencies");
-            for (uint32_t i = 0; i < dependencies.Size(); ++i) {
-                auto depValue = dependencies.GetAt(i);
-                if (depValue.ValueType() != JsonValueType::Object) continue;
-                JsonObject dep = depValue.GetObject();
-                if (JsonStringOrEmpty(dep, L"dependency_type") != L"required") continue;
-                const std::wstring depProject = JsonStringOrEmpty(dep, L"project_id");
-                if (!depProject.empty() &&
-                    !InstallModrinthProjectRecursive(depProject, runtimeRoot, userModsDir, visited, installed, nullptr, error, gameVersion, loaderId)) {
-                    return false;
+        EnsureDirectoryTree(userModsDir);
+        std::wstring lastSkipReason;
+        for (JsonObject version : candidates) {
+            std::wstring downloadUrl;
+            std::wstring filename;
+            std::string sha1;
+            unsigned long long fileSize = 0;
+            if (!ExtractPrimaryModrinthFile(version, downloadUrl, filename, sha1, fileSize)) {
+                lastSkipReason = L"version without downloadable file";
+                continue;
+            }
+            if (const BlockedMod* blocked = FindBlockedModFile(filename)) {
+                error = L"Blocked incompatible mod: " + filename;
+                WriteLogF(L"%s (%s)", error.c_str(), blocked->reason);
+                return false;
+            }
+
+            const std::wstring destination = userModsDir + L"\\" + SafeFileName(filename);
+            if (FileMatchesSha1(destination, sha1)) {
+                std::wstring reason;
+                if (ModJarMatchesFabricLoader(destination, loaderVersion, reason)) {
+                    WriteLogF(L"Mod already installed: %s", destination.c_str());
+                    return true;
+                }
+                WriteLogF(L"Installed Modrinth file is not compatible with target loader: %s (%s)",
+                    destination.c_str(), reason.c_str());
+            }
+
+            const std::wstring tempPath = destination + L".download";
+            DeleteFileW(tempPath.c_str());
+            WriteLogF(L"Downloading Modrinth mod candidate %s", filename.c_str());
+            SetInstallStatus(L"Checking " + filename);
+            if (!DownloadUrlToFile(downloadUrl, tempPath, MakeInstallProgress(L"Checking " + filename, fileSize))) {
+                DeleteFileW(tempPath.c_str());
+                error = L"Mod download failed: " + filename;
+                return false;
+            }
+
+            if (!FileMatchesSha1(tempPath, sha1)) {
+                DeleteFileW(tempPath.c_str());
+                error = L"Mod verification failed: " + filename;
+                return false;
+            }
+
+            std::wstring incompatReason;
+            if (!ModJarMatchesFabricLoader(tempPath, loaderVersion, incompatReason)) {
+                DeleteFileW(tempPath.c_str());
+                lastSkipReason = filename + L" " + incompatReason;
+                WriteLogF(L"Skipping Modrinth file for target loader %s: %s",
+                    a2w(loaderVersion.c_str()).c_str(), lastSkipReason.c_str());
+                continue;
+            }
+
+            if (version.HasKey(L"dependencies") &&
+                version.GetNamedValue(L"dependencies").ValueType() == JsonValueType::Array) {
+                JsonArray dependencies = version.GetNamedArray(L"dependencies");
+                for (uint32_t i = 0; i < dependencies.Size(); ++i) {
+                    auto depValue = dependencies.GetAt(i);
+                    if (depValue.ValueType() != JsonValueType::Object) continue;
+                    JsonObject dep = depValue.GetObject();
+                    if (JsonStringOrEmpty(dep, L"dependency_type") != L"required") continue;
+                    const std::wstring depProject = JsonStringOrEmpty(dep, L"project_id");
+                    if (!depProject.empty() &&
+                        !InstallModrinthProjectRecursive(depProject, runtimeRoot, userModsDir, visited, installed, nullptr, error, gameVersion, loaderId, loaderVersion)) {
+                        DeleteFileW(tempPath.c_str());
+                        return false;
+                    }
                 }
             }
-        }
 
-        std::wstring downloadUrl;
-        std::wstring filename;
-        std::string sha1;
-        unsigned long long fileSize = 0;
-        if (!ExtractPrimaryModrinthFile(version, downloadUrl, filename, sha1, fileSize)) {
-            error = L"Modrinth version did not include a downloadable file";
-            return false;
-        }
-        if (const BlockedMod* blocked = FindBlockedModFile(filename)) {
-            error = L"Blocked incompatible mod: " + filename;
-            WriteLogF(L"%s (%s)", error.c_str(), blocked->reason);
-            return false;
-        }
+            DeleteFileW(destination.c_str());
+            if (!MoveFileExW(tempPath.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                DeleteFileW(tempPath.c_str());
+                error = L"Could not install mod: " + filename;
+                WriteLogF(L"MoveFileEx failed for mod %s err=%u", destination.c_str(), GetLastError());
+                return false;
+            }
 
-        EnsureDirectoryTree(userModsDir);
-        const std::wstring destination = userModsDir + L"\\" + SafeFileName(filename);
-        if (FileMatchesSha1(destination, sha1)) {
-            WriteLogF(L"Mod already installed: %s", destination.c_str());
+            installed.push_back(filename);
+            if (topMeta) {
+                ModCard meta = *topMeta;
+                WriteModMeta(runtimeRoot, filename, meta);
+            }
+            WriteLogF(L"Installed Modrinth mod %s", destination.c_str());
             return true;
         }
 
-        const std::wstring tempPath = destination + L".download";
-        DeleteFileW(tempPath.c_str());
-        WriteLogF(L"Downloading Modrinth mod %s", filename.c_str());
-        SetInstallStatus(L"Installing " + filename);
-        if (!DownloadUrlToFile(downloadUrl, tempPath, MakeInstallProgress(L"Installing " + filename, fileSize))) {
-            DeleteFileW(tempPath.c_str());
-            error = L"Mod download failed: " + filename;
-            return false;
-        }
-
-        if (!FileMatchesSha1(tempPath, sha1)) {
-            DeleteFileW(tempPath.c_str());
-            error = L"Mod verification failed: " + filename;
-            return false;
-        }
-
-        DeleteFileW(destination.c_str());
-        if (!MoveFileExW(tempPath.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-            DeleteFileW(tempPath.c_str());
-            error = L"Could not install mod: " + filename;
-            WriteLogF(L"MoveFileEx failed for mod %s err=%u", destination.c_str(), GetLastError());
-            return false;
-        }
-
-        installed.push_back(filename);
-        if (topMeta) {
-            ModCard meta = *topMeta;
-            WriteModMeta(runtimeRoot, filename, meta);
-        }
-        WriteLogF(L"Installed Modrinth mod %s", destination.c_str());
-        return true;
+        error = L"No Modrinth file matched " + a2w(gameVersion.c_str()) + L" / " +
+            a2w(loaderId.c_str()) + L" " + a2w(loaderVersion.c_str());
+        if (!lastSkipReason.empty()) error += L" (" + lastSkipReason + L")";
+        return false;
     } catch (const winrt::hresult_error& ex) {
         error = L"Could not parse Modrinth version response";
         WriteLogF(L"Modrinth version parse failed hr=0x%08X msg=%s",
@@ -2441,10 +2639,11 @@ static bool InstallModrinthProject(
     std::vector<std::wstring>& installed,
     std::wstring& error,
     const std::string& gameVersion,
-    const std::string& loaderId) {
+    const std::string& loaderId,
+    const std::string& loaderVersion) {
     std::set<std::wstring> visited;
     const std::wstring id = !card.projectId.empty() ? card.projectId : card.slug;
-    return InstallModrinthProjectRecursive(id, runtimeRoot, userModsDir, visited, installed, &card, error, gameVersion, loaderId);
+    return InstallModrinthProjectRecursive(id, runtimeRoot, userModsDir, visited, installed, &card, error, gameVersion, loaderId, loaderVersion);
 }
 
 static bool WriteAllBytes(const std::wstring& path, const void* data, size_t size) {
@@ -2453,6 +2652,160 @@ static bool WriteAllBytes(const std::wstring& path, const void* data, size_t siz
     if (!f) return false;
     if (size) f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
     return f.good();
+}
+
+static std::wstring SafePathSegment(const std::wstring& value) {
+    std::wstring out;
+    out.reserve(value.size());
+    for (wchar_t c : value) {
+        const bool ok =
+            (c >= L'a' && c <= L'z') ||
+            (c >= L'A' && c <= L'Z') ||
+            (c >= L'0' && c <= L'9') ||
+            c == L'.' || c == L'_' || c == L'-';
+        out.push_back(ok ? c : L'_');
+    }
+    return out.empty() ? L"default" : out;
+}
+
+static bool EndsWithAsciiNoCase(const std::string& value, const char* suffix) {
+    const std::string lower = ToLowerAscii(value);
+    const std::string suffixLower = ToLowerAscii(suffix);
+    return lower.size() >= suffixLower.size() &&
+        lower.compare(lower.size() - suffixLower.size(), suffixLower.size(), suffixLower) == 0;
+}
+
+static bool ExtractDllsFromJar(const std::wstring& jarPath, const std::wstring& destDir, bool jnaOnly) {
+    std::ifstream in(jarPath, std::ios::binary);
+    if (!in) {
+        WriteLogF(L"Could not open native jar: %s", jarPath.c_str());
+        return false;
+    }
+    std::vector<unsigned char> jarBytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (jarBytes.empty()) {
+        WriteLogF(L"Native jar is empty: %s", jarPath.c_str());
+        return false;
+    }
+
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_mem(&zip, jarBytes.data(), jarBytes.size(), 0)) {
+        WriteLogF(L"Could not open native jar: %s", jarPath.c_str());
+        return false;
+    }
+
+    bool extractedAny = false;
+    const mz_uint entryCount = mz_zip_reader_get_num_files(&zip);
+    for (mz_uint i = 0; i < entryCount; ++i) {
+        if (mz_zip_reader_is_file_a_directory(&zip, i)) continue;
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
+
+        std::string name = st.m_filename ? st.m_filename : "";
+        std::replace(name.begin(), name.end(), '\\', '/');
+        const size_t slash = name.find_last_of('/');
+        const std::string base = slash == std::string::npos ? name : name.substr(slash + 1);
+        const std::string lowerName = ToLowerAscii(name);
+        const std::string lowerBase = ToLowerAscii(base);
+        if (!EndsWithAsciiNoCase(base, ".dll")) continue;
+        if (jnaOnly && (lowerBase != "jnidispatch.dll" || lowerName.find("win32-x86-64/") == std::string::npos)) continue;
+
+        size_t outSize = 0;
+        void* p = mz_zip_reader_extract_to_heap(&zip, i, &outSize, 0);
+        if (!p) {
+            WriteLogF(L"Could not extract %s from %s", a2w(name.c_str()).c_str(), jarPath.c_str());
+            continue;
+        }
+
+        const bool ok = WriteAllBytes(destDir + L"\\" + a2w(base.c_str()), p, outSize);
+        mz_free(p);
+        if (ok) extractedAny = true;
+    }
+
+    mz_zip_reader_end(&zip);
+    return extractedAny;
+}
+
+static void CollectManifestNativeSources(
+    const std::wstring& manifestPath,
+    const std::wstring& runtimeRoot,
+    std::vector<std::wstring>& lwjglNativeJars,
+    std::vector<std::wstring>& jnaJars) {
+    std::vector<DownloadManifestEntry> entries;
+    if (!ReadDownloadManifest(manifestPath, entries)) return;
+    for (const auto& e : entries) {
+        std::wstring rel = e.relativePath;
+        std::replace(rel.begin(), rel.end(), L'\\', L'/');
+        for (wchar_t& c : rel) c = static_cast<wchar_t>(towlower(c));
+        if (rel.rfind(L"game/libraries/", 0) != 0) continue;
+        if (rel.size() < 4 || rel.compare(rel.size() - 4, 4, L".jar") != 0) continue;
+
+        const std::wstring abs = JoinRuntimeRelativePath(runtimeRoot, e.relativePath);
+        if (abs.empty()) continue;
+        if (rel.find(L"/org/lwjgl/") != std::wstring::npos &&
+            rel.find(L"-natives-windows.jar") != std::wstring::npos) {
+            lwjglNativeJars.push_back(abs);
+        } else if (rel.find(L"/net/java/dev/jna/jna/") != std::wstring::npos &&
+            rel.find(L"/jna-") != std::wstring::npos) {
+            jnaJars.push_back(abs);
+        }
+    }
+}
+
+static bool PrepareTargetNativeDir(
+    const std::wstring& manifestPath,
+    const std::wstring& runtimeRoot,
+    const std::wstring& packageDir,
+    const std::wstring& targetId,
+    std::wstring& nativeDir) {
+    if (manifestPath.empty() || targetId.empty()) return false;
+
+    nativeDir = runtimeRoot + L"\\runtime\\natives\\" + SafePathSegment(targetId);
+    const std::wstring packageNativesDir = packageDir + L"\\natives";
+    const std::wstring markerPath = nativeDir + L"\\.native_manifest";
+    const std::wstring marker = L"nativeVersion=2\nmanifest=" + FileStamp(manifestPath) +
+        L"\nglfw=" + FileStamp(packageNativesDir + L"\\glfw.dll") + L"\n";
+
+    std::wstring existingMarker;
+    if (ReadTextFile(markerPath, existingMarker) && existingMarker == marker &&
+        GetFileAttributesW((nativeDir + L"\\lwjgl.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW((nativeDir + L"\\glfw.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW((nativeDir + L"\\jnidispatch.dll").c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return true;
+    }
+
+    DeleteDirectoryTree(nativeDir);
+    EnsureDirectoryTree(nativeDir);
+
+    std::vector<std::wstring> lwjglNativeJars;
+    std::vector<std::wstring> jnaJars;
+    CollectManifestNativeSources(manifestPath, runtimeRoot, lwjglNativeJars, jnaJars);
+    WriteLogF(L"Preparing target natives target=%s lwjglNativeJars=%zu jnaJars=%zu",
+        targetId.c_str(), lwjglNativeJars.size(), jnaJars.size());
+
+    bool extractedLwjgl = false;
+    for (const std::wstring& jar : lwjglNativeJars) {
+        extractedLwjgl = ExtractDllsFromJar(jar, nativeDir, false) || extractedLwjgl;
+    }
+
+    bool extractedJna = false;
+    for (const std::wstring& jar : jnaJars) {
+        extractedJna = ExtractDllsFromJar(jar, nativeDir, true) || extractedJna;
+    }
+
+    CopyFileIfNeeded(packageNativesDir + L"\\glfw.dll", nativeDir + L"\\glfw.dll");
+
+    const bool ready =
+        extractedLwjgl &&
+        extractedJna &&
+        GetFileAttributesW((nativeDir + L"\\lwjgl.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW((nativeDir + L"\\glfw.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW((nativeDir + L"\\jnidispatch.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (ready) {
+        WriteTextFile(markerPath, marker);
+    } else {
+        WriteLogF(L"Target native preparation incomplete target=%s dir=%s", targetId.c_str(), nativeDir.c_str());
+    }
+    return ready;
 }
 
 static bool ResolveModpackMrpack(const std::wstring& idOrSlug, std::wstring& url, std::wstring& filename, std::string& sha1, unsigned long long& size, std::wstring& error, const std::string& gameVersion, const std::string& loaderId) {
@@ -2958,8 +3311,8 @@ static std::vector<LaunchTarget> LoadVersionCatalog(const std::wstring& runtimeR
     std::vector<LaunchTarget> out;
     const std::wstring packageDir = GetExecutableDir();
     const std::wstring paths[] = {
-        runtimeRoot + L"\\runtime\\version_catalog.tsv",
-        packageDir + L"\\runtime\\version_catalog.tsv"
+        packageDir + L"\\runtime\\version_catalog.tsv",
+        runtimeRoot + L"\\runtime\\version_catalog.tsv"
     };
 
     std::wstring body;
@@ -3015,15 +3368,20 @@ static LaunchTarget ResolveLaunchTarget(const std::wstring& runtimeRoot, const s
 
 static LaunchTarget ResolveProfileTarget(const std::wstring& runtimeRoot, const Profile& profile) {
     const std::vector<LaunchTarget> targets = LoadVersionCatalog(runtimeRoot);
+    LaunchTarget profileTarget = TargetFromProfile(profile);
     const std::wstring id = profile.targetId.empty()
-        ? MakeTargetId(profile.minecraftVersion.empty() ? std::wstring(kDefaultMinecraftVersionW) : profile.minecraftVersion,
-                       profile.loader.empty() ? std::wstring(L"fabric") : profile.loader,
-                       profile.loaderVersion.empty() ? a2w(kDefaultFabricLoaderVersion) : profile.loaderVersion)
+        ? profileTarget.targetId
         : profile.targetId;
     for (const LaunchTarget& t : targets) {
         if (t.targetId == id) return t;
     }
-    return TargetFromProfile(profile);
+    for (const LaunchTarget& t : targets) {
+        if (t.minecraftVersion == profileTarget.minecraftVersion &&
+            _wcsicmp(t.loader.c_str(), profileTarget.loader.c_str()) == 0) {
+            return t;
+        }
+    }
+    return profileTarget;
 }
 
 struct MinecraftVersionInfo {
@@ -3385,6 +3743,7 @@ static void StartInstallJob(const ModCard& card, const std::wstring& runtimeRoot
     std::thread([copy, rootCopy, targetCopy]() {
         const std::string gameVersion = w2a(targetCopy.minecraftVersion);
         const std::string loaderId = ModrinthLoaderId(targetCopy.loader);
+        const std::string loaderVersion = w2a(targetCopy.loaderVersion);
         std::wstring err;
         bool ok;
         if (copy.isModpack) {
@@ -3405,8 +3764,7 @@ static void StartInstallJob(const ModCard& card, const std::wstring& runtimeRoot
                 SetInstallStatus(L"Vanilla is read-only. Pick or make a profile first.");
             } else {
                 const LaunchTarget activeTarget = ResolveProfileTarget(rootCopy, GetProfileById(rootCopy, active));
-                if (activeTarget.minecraftVersion != targetCopy.minecraftVersion ||
-                    _wcsicmp(activeTarget.loader.c_str(), targetCopy.loader.c_str()) != 0) {
+                if (activeTarget.targetId != targetCopy.targetId) {
                     ok = false;
                     WriteLogF(L"Install blocked: browse target %s != active profile target %s",
                         targetCopy.targetId.c_str(), activeTarget.targetId.c_str());
@@ -3415,7 +3773,7 @@ static void StartInstallJob(const ModCard& card, const std::wstring& runtimeRoot
                 } else {
                     std::vector<std::wstring> installed;
                     WriteLogF(L"Installing mod '%s' target=%s into profile %s", copy.title.c_str(), targetCopy.targetId.c_str(), active.c_str());
-                    ok = InstallModrinthProject(copy, rootCopy, ProfileModsDir(rootCopy, active), installed, err, gameVersion, loaderId);
+                    ok = InstallModrinthProject(copy, rootCopy, ProfileModsDir(rootCopy, active), installed, err, gameVersion, loaderId, loaderVersion);
                     SetInstallStatus(ok
                         ? (installed.empty() ? L"Already installed" : L"Installed " + std::to_wstring(installed.size()) + L" file(s)")
                         : (err.empty() ? L"Install failed" : err));
@@ -6576,11 +6934,15 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::wstring jnaTmpDir = nativesDir;
     const std::wstring lwjglTmpDir = exeDir + L"\\tmp";
     const std::wstring packagedNativesDir = packageDir + L"\\natives";
-    const std::wstring lwjglNativeDir =
+    const bool suppliedNativesReady =
+        GetFileAttributesW((nativesDir + L"\\lwjgl.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW((nativesDir + L"\\glfw.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool packagedNativesReady =
         GetFileAttributesW((packagedNativesDir + L"\\lwjgl.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
-        GetFileAttributesW((packagedNativesDir + L"\\glfw.dll").c_str()) != INVALID_FILE_ATTRIBUTES
-            ? packagedNativesDir
-            : nativesDir;
+        GetFileAttributesW((packagedNativesDir + L"\\glfw.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const std::wstring lwjglNativeDir =
+        suppliedNativesReady ? nativesDir :
+        (packagedNativesReady ? packagedNativesDir : nativesDir);
     const std::wstring lwjglGlfwDll = lwjglNativeDir + L"\\glfw.dll";
     const std::wstring logConfigPath = gameDir + L"\\log_configs\\client-uwp.xml";
     const std::wstring fabricLogPath = gameDir + L"\\logs\\fabric-loader.log";
@@ -7103,11 +7465,23 @@ public:
         const std::wstring assetsDir = exeDir + L"\\assets";
         const std::wstring localNativesDir = exeDir + L"\\natives";
         const std::wstring packageNativesDir = packageDir + L"\\natives";
-        const std::wstring nativesDir =
+        const std::wstring effManifestPath = versionInfo.manifestPath.empty()
+            ? (packageDir + L"\\download_manifest.tsv")
+            : versionInfo.manifestPath;
+        std::wstring nativesDir =
             GetFileAttributesW((packageNativesDir + L"\\lwjgl.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
             GetFileAttributesW((packageNativesDir + L"\\glfw.dll").c_str()) != INVALID_FILE_ATTRIBUTES
                 ? packageNativesDir
                 : localNativesDir;
+        const LaunchTarget defaultTarget = DefaultLaunchTarget();
+        if (versionInfo.targetId != defaultTarget.targetId) {
+            std::wstring targetNativesDir;
+            if (PrepareTargetNativeDir(effManifestPath, exeDir, packageDir, versionInfo.targetId, targetNativesDir)) {
+                nativesDir = targetNativesDir;
+            } else {
+                WriteLogF(L"Falling back to default natives for target=%s", versionInfo.targetId.c_str());
+            }
+        }
         const std::wstring minecraftVersion = versionInfo.minecraftVersion;
         const std::wstring packageRuntimeDir = packageDir + L"\\runtime";
         const std::wstring packagedLibrariesDir = packageRuntimeDir + L"\\libraries";
@@ -7137,9 +7511,6 @@ public:
         WriteLogF(L"gameDir   exists=%d", GetFileAttributesW(gameDir.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"clientJar exists=%d", GetFileAttributesW(clientJar.c_str()) != INVALID_FILE_ATTRIBUTES);
 
-        const std::wstring effManifestPath = versionInfo.manifestPath.empty()
-            ? (packageDir + L"\\download_manifest.tsv")
-            : versionInfo.manifestPath;
         std::vector<std::wstring> jars;
         if (!versionInfo.loaderJar.empty()) {
             jars.push_back(versionInfo.loaderJar);

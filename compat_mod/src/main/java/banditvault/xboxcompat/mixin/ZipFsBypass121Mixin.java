@@ -7,14 +7,14 @@ import java.nio.file.Path;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Overwrite;
 
-@Mixin(net.minecraft.class_10619.class)
-public abstract class ZipFsBypassMixin {
+@Mixin(targets = "net.minecraft.class_7665")
+public abstract class ZipFsBypass121Mixin {
     /**
      * @author Codex
      * @reason ZipFileSystemProvider's URI path calls toRealPath(), which fails in Xbox Dev Mode.
      */
     @Overwrite
-    public static Path method_66590(URI uri) throws IOException {
+    public static Path method_45203(URI uri) throws IOException {
         return ZipFsPathResolver.resolve(uri);
     }
 }
