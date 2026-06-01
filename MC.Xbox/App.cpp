@@ -267,11 +267,11 @@ static std::wstring RuntimeSeedStamp(const std::wstring& packageDir) {
         L"minecraft=" + std::wstring(kMinecraftVersionW) + L"\n" +
         L"jreRelease=" + FileStamp(packageDir + L"\\jre\\release") + L"\n" +
         L"jvm=" + FileStamp(packageDir + L"\\jre\\bin\\server\\jvm.dll") + L"\n" +
-        L"securityPatch=" + FileStamp(packageDir + L"\\java-base-security-realpath.jar") + L"\n" +
+        L"javaBasePatch=" + FileStamp(packageDir + L"\\java-base-uwp-filesystem.jar") + L"\n" +
         L"zipfsPatch=" + FileStamp(packageDir + L"\\java-zipfs-realpath.jar") + L"\n" +
         L"jre21Release=" + FileStamp(packageDir + L"\\jre21\\release") + L"\n" +
         L"jvm21=" + FileStamp(packageDir + L"\\jre21\\bin\\server\\jvm.dll") + L"\n" +
-        L"securityPatch21=" + FileStamp(packageDir + L"\\java-base-security-realpath-21.jar") + L"\n" +
+        L"javaBasePatch21=" + FileStamp(packageDir + L"\\java-base-uwp-filesystem-21.jar") + L"\n" +
         L"zipfsPatch21=" + FileStamp(packageDir + L"\\java-zipfs-realpath-21.jar") + L"\n" +
         L"patchedFabricLoader=" + FileStamp(packageDir + L"\\runtime\\libraries\\net\\fabricmc\\fabric-loader\\" + a2w(kFabricLoaderVersion) + L"\\fabric-loader-" + a2w(kFabricLoaderVersion) + L".jar") + L"\n" +
         L"bundledMods=" + FileStamp(packageDir + L"\\runtime\\bundled-mods") + L"\n" +
@@ -301,8 +301,8 @@ static bool IsLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std:
     const bool hasJre =
         GetFileAttributesW((localDir + L"\\jre\\bin\\server\\jvm.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
         GetFileAttributesW((localDir + L"\\jre\\conf\\security\\java.security").c_str()) != INVALID_FILE_ATTRIBUTES;
-    const bool hasJavaSecurityPatch =
-        GetFileAttributesW((localDir + L"\\java-base-security-realpath.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool hasJavaBasePatch =
+        GetFileAttributesW((localDir + L"\\java-base-uwp-filesystem.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool hasJavaZipfsPatch =
         GetFileAttributesW((localDir + L"\\java-zipfs-realpath.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool packageHasJre21 =
@@ -310,11 +310,11 @@ static bool IsLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std:
     const bool hasJre21 = !packageHasJre21 ||
         (GetFileAttributesW((localDir + L"\\jre21\\bin\\server\\jvm.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
             GetFileAttributesW((localDir + L"\\jre21\\conf\\security\\java.security").c_str()) != INVALID_FILE_ATTRIBUTES);
-    const bool hasJavaSecurityPatch21 = !packageHasJre21 ||
-        GetFileAttributesW((localDir + L"\\java-base-security-realpath-21.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool hasJavaBasePatch21 = !packageHasJre21 ||
+        GetFileAttributesW((localDir + L"\\java-base-uwp-filesystem-21.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool hasJavaZipfsPatch21 = !packageHasJre21 ||
         GetFileAttributesW((localDir + L"\\java-zipfs-realpath-21.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
-    return hasGameSupport && hasNatives && hasGraphics && hasJre && hasJavaSecurityPatch && hasJavaZipfsPatch && hasJre21 && hasJavaSecurityPatch21 && hasJavaZipfsPatch21;
+    return hasGameSupport && hasNatives && hasGraphics && hasJre && hasJavaBasePatch && hasJavaZipfsPatch && hasJre21 && hasJavaBasePatch21 && hasJavaZipfsPatch21;
 }
 
 static void MarkLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std::wstring& localDir) {
@@ -408,8 +408,8 @@ static bool SeedLocalRuntime(
         progress(L"Finalizing runtime", L"Writing launch configuration", 0.96f);
     }
     CopyFileIfNeeded(packageDir + L"\\xbox_security.properties", localDir + L"\\xbox_security.properties");
-    CopyFileIfNeeded(packageDir + L"\\java-base-security-realpath.jar", localDir + L"\\java-base-security-realpath.jar");
-    CopyFileIfNeeded(packageDir + L"\\java-base-security-realpath-21.jar", localDir + L"\\java-base-security-realpath-21.jar");
+    CopyFileIfNeeded(packageDir + L"\\java-base-uwp-filesystem.jar", localDir + L"\\java-base-uwp-filesystem.jar");
+    CopyFileIfNeeded(packageDir + L"\\java-base-uwp-filesystem-21.jar", localDir + L"\\java-base-uwp-filesystem-21.jar");
     CopyFileIfNeeded(packageDir + L"\\java-zipfs-realpath.jar", localDir + L"\\java-zipfs-realpath.jar");
     CopyFileIfNeeded(packageDir + L"\\java-zipfs-realpath-21.jar", localDir + L"\\java-zipfs-realpath-21.jar");
     if (progress) {
@@ -3338,7 +3338,7 @@ struct JavaRuntimeInfo {
     std::wstring packageDir;
     std::wstring localDir;
     std::wstring selectedDir;
-    std::wstring securityPatchName;
+    std::wstring javaBasePatchName;
     std::wstring zipfsPatchName;
 };
 
@@ -3354,12 +3354,12 @@ static JavaRuntimeInfo ResolveJavaRuntimeInfo(
     if (id == L"java21" || id == L"legacy21" || id == L"jdk21" || id == L"21") {
         info.runtimeId = L"java21";
         info.packageRelativeDir = L"jre21";
-        info.securityPatchName = L"java-base-security-realpath-21.jar";
+        info.javaBasePatchName = L"java-base-uwp-filesystem-21.jar";
         info.zipfsPatchName = L"java-zipfs-realpath-21.jar";
     } else {
         info.runtimeId = L"current";
         info.packageRelativeDir = L"jre";
-        info.securityPatchName = L"java-base-security-realpath.jar";
+        info.javaBasePatchName = L"java-base-uwp-filesystem.jar";
         info.zipfsPatchName = L"java-zipfs-realpath.jar";
     }
 
@@ -7002,7 +7002,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::wstring& packageDir,
     const std::wstring& jreDir,
     const std::wstring& packagedJreRelativeDir,
-    const std::wstring& javaSecurityPatchName,
+    const std::wstring& javaBasePatchName,
     const std::wstring& javaZipfsPatchName,
     const std::wstring& gameDir,
     const std::wstring& assetsDir,
@@ -7087,19 +7087,19 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Xms512M");
     vmOptionStorage.push_back("--enable-native-access=ALL-UNNAMED");
     vmOptionStorage.push_back("--add-opens=jdk.zipfs/jdk.nio.zipfs=ALL-UNNAMED");
-    const std::wstring selectedJavaSecurityPatchName =
-        javaSecurityPatchName.empty() ? L"java-base-security-realpath.jar" : javaSecurityPatchName;
-    const std::wstring localJavaSecurityPatch = exeDir + L"\\" + selectedJavaSecurityPatchName;
-    const std::wstring packagedJavaSecurityPatch = packageDir + L"\\" + selectedJavaSecurityPatchName;
-    const std::wstring javaSecurityPatch =
-        GetFileAttributesW(localJavaSecurityPatch.c_str()) != INVALID_FILE_ATTRIBUTES
-            ? localJavaSecurityPatch
-            : packagedJavaSecurityPatch;
-    if (GetFileAttributesW(javaSecurityPatch.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        vmOptionStorage.push_back("--patch-module=java.base=" + w2a(fwd(javaSecurityPatch)));
-        WriteLogF(L"Java security realpath patch enabled: %s", javaSecurityPatch.c_str());
+    const std::wstring selectedJavaBasePatchName =
+        javaBasePatchName.empty() ? L"java-base-uwp-filesystem.jar" : javaBasePatchName;
+    const std::wstring localJavaBasePatch = exeDir + L"\\" + selectedJavaBasePatchName;
+    const std::wstring packagedJavaBasePatch = packageDir + L"\\" + selectedJavaBasePatchName;
+    const std::wstring javaBasePatch =
+        GetFileAttributesW(localJavaBasePatch.c_str()) != INVALID_FILE_ATTRIBUTES
+            ? localJavaBasePatch
+            : packagedJavaBasePatch;
+    if (GetFileAttributesW(javaBasePatch.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        vmOptionStorage.push_back("--patch-module=java.base=" + w2a(fwd(javaBasePatch)));
+        WriteLogF(L"Java base UWP filesystem patch enabled: %s", javaBasePatch.c_str());
     } else {
-        WriteLogF(L"Java security realpath patch missing: %s", javaSecurityPatch.c_str());
+        WriteLogF(L"Java base UWP filesystem patch missing: %s", javaBasePatch.c_str());
     }
     const std::wstring selectedJavaZipfsPatchName =
         javaZipfsPatchName.empty() ? L"java-zipfs-realpath.jar" : javaZipfsPatchName;
@@ -7603,11 +7603,11 @@ public:
         const std::wstring javaLog = exeDir + L"\\java_output.log";
 
         WriteLogF(L"exeDir: %s", exeDir.c_str());
-        WriteLogF(L"target java runtime: requested=%s resolved=%s packageRelative=%s securityPatch=%s zipfsPatch=%s",
+        WriteLogF(L"target java runtime: requested=%s resolved=%s packageRelative=%s javaBasePatch=%s zipfsPatch=%s",
             versionInfo.javaRuntime.c_str(),
             javaRuntime.runtimeId.c_str(),
             javaRuntime.packageRelativeDir.c_str(),
-            javaRuntime.securityPatchName.c_str(),
+            javaRuntime.javaBasePatchName.c_str(),
             javaRuntime.zipfsPatchName.c_str());
         WriteLogF(L"jreDir: %s", jreDir.c_str());
         WriteLogF(L"jre release stamp: %s", FileStamp(jreDir + L"\\release").c_str());
@@ -7650,7 +7650,7 @@ public:
                 packageDir,
                 jreDir,
             javaRuntime.packageRelativeDir,
-            javaRuntime.securityPatchName,
+            javaRuntime.javaBasePatchName,
             javaRuntime.zipfsPatchName,
             gameDir,
                 assetsDir,

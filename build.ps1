@@ -625,29 +625,29 @@ function Copy-PackagedJre {
     Copy-Item $SecurityPropertiesPath (Join-Path $dest "conf\security\java.security") -Force
 }
 
-function Build-JavaSecurityRealpathPatch {
+function Build-JavaBaseUwpFilesystemPatch {
     param(
         [Parameter(Mandatory = $true)][string]$JavaHome,
         [Parameter(Mandatory = $true)][string]$OutputJar,
         [Parameter(Mandatory = $true)][string]$WorkName
     )
 
-    Write-Host "Building Java security realpath patch: $OutputJar"
+    Write-Host "Building Java base UWP filesystem patch: $OutputJar"
     $javacExe = Join-Path $JavaHome "bin\javac.exe"
-    if (-not (Test-Path $javacExe)) { throw "javac.exe not found at $javacExe; Java security patch requires a JDK, not a JRE." }
+    if (-not (Test-Path $javacExe)) { throw "javac.exe not found at $javacExe; Java base UWP filesystem patch requires a JDK, not a JRE." }
     $runtimeJarExe = Join-Path $JavaHome "bin\jar.exe"
     if (-not (Test-Path $runtimeJarExe)) { $runtimeJarExe = $jarExe }
     $srcZip = Join-Path $JavaHome "lib\src.zip"
-    if (-not (Test-Path $srcZip)) { throw "JDK source archive not found at $srcZip; Java security patch cannot be generated." }
-    $javaSecurityPatchDir = Join-Path $buildDir $WorkName
-    $javaSecurityPatchSrcDir = Join-Path $javaSecurityPatchDir "src"
-    $javaSecurityPatchClassesDir = Join-Path $javaSecurityPatchDir "classes"
-    Remove-Item -Recurse -Force $javaSecurityPatchDir -ErrorAction SilentlyContinue
+    if (-not (Test-Path $srcZip)) { throw "JDK source archive not found at $srcZip; Java base UWP filesystem patch cannot be generated." }
+    $javaBasePatchDir = Join-Path $buildDir $WorkName
+    $javaBasePatchSrcDir = Join-Path $javaBasePatchDir "src"
+    $javaBasePatchClassesDir = Join-Path $javaBasePatchDir "classes"
+    Remove-Item -Recurse -Force $javaBasePatchDir -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path `
-        (Join-Path $javaSecurityPatchSrcDir "java\io"), `
-        (Join-Path $javaSecurityPatchSrcDir "java\security"), `
-        (Join-Path $javaSecurityPatchSrcDir "sun\nio\fs"), `
-        $javaSecurityPatchClassesDir | Out-Null
+        (Join-Path $javaBasePatchSrcDir "java\io"), `
+        (Join-Path $javaBasePatchSrcDir "java\security"), `
+        (Join-Path $javaBasePatchSrcDir "sun\nio\fs"), `
+        $javaBasePatchClassesDir | Out-Null
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $srcArchive = [System.IO.Compression.ZipFile]::OpenRead($srcZip)
     try {
@@ -684,10 +684,10 @@ function Build-JavaSecurityRealpathPatch {
     $newSecurityLine = "try { path = path.toRealPath(); } catch (IOException realPathFailure) { path = path.toAbsolutePath(); }"
     $javaBasePatchSources = @()
     if (-not $securitySource.Contains($oldSecurityLine)) {
-        Write-Warning "Security.java patch target not found for $JavaHome; continuing with WindowsPath realpath patch only."
+        Write-Warning "Security.java realpath patch target not found for $JavaHome; continuing with other java.base UWP filesystem patches."
     } else {
         $securitySource = $securitySource.Replace($oldSecurityLine, $newSecurityLine)
-        $securitySourcePath = Join-Path $javaSecurityPatchSrcDir "java\security\Security.java"
+        $securitySourcePath = Join-Path $javaBasePatchSrcDir "java\security\Security.java"
         [System.IO.File]::WriteAllText($securitySourcePath, $securitySource)
         $javaBasePatchSources += $securitySourcePath
     }
@@ -705,7 +705,7 @@ function Build-JavaSecurityRealpathPatch {
         throw "File.java temp-file nameMax patch target not found for $JavaHome."
     }
     $fileSource = $fileSource.Replace($oldFileLine, $newFileBlock)
-    $fileSourcePath = Join-Path $javaSecurityPatchSrcDir "java\io\File.java"
+    $fileSourcePath = Join-Path $javaBasePatchSrcDir "java\io\File.java"
     [System.IO.File]::WriteAllText($fileSourcePath, $fileSource)
     $javaBasePatchSources += $fileSourcePath
 
@@ -725,17 +725,17 @@ function Build-JavaSecurityRealpathPatch {
         throw "WindowsPath.java realpath patch target not found for $JavaHome."
     }
     $windowsPathSource = $windowsPathSource.Replace($oldWindowsPathBlock, $newWindowsPathBlock)
-    $windowsPathSourcePath = Join-Path $javaSecurityPatchSrcDir "sun\nio\fs\WindowsPath.java"
+    $windowsPathSourcePath = Join-Path $javaBasePatchSrcDir "sun\nio\fs\WindowsPath.java"
     [System.IO.File]::WriteAllText($windowsPathSourcePath, $windowsPathSource)
     $javaBasePatchSources += $windowsPathSourcePath
 
-    & $javacExe --patch-module "java.base=$javaSecurityPatchSrcDir" -d $javaSecurityPatchClassesDir $javaBasePatchSources
-    if ($LASTEXITCODE -ne 0) { throw "Java security patch compile failed" }
-    Push-Location $javaSecurityPatchClassesDir
+    & $javacExe --patch-module "java.base=$javaBasePatchSrcDir" -d $javaBasePatchClassesDir $javaBasePatchSources
+    if ($LASTEXITCODE -ne 0) { throw "Java base UWP filesystem patch compile failed" }
+    Push-Location $javaBasePatchClassesDir
     & $runtimeJarExe cf $OutputJar .
     Pop-Location
-    if ($LASTEXITCODE -ne 0) { throw "Java security patch jar creation failed" }
-    Write-Host "Java security patch: $OutputJar"
+    if ($LASTEXITCODE -ne 0) { throw "Java base UWP filesystem patch jar creation failed" }
+    Write-Host "Java base UWP filesystem patch: $OutputJar"
 }
 
 function Build-JavaZipfsRealpathPatch {
@@ -824,8 +824,8 @@ $xboxSecurityProperties = Join-Path $root "xbox_security.properties"
 Copy-Item $xboxSecurityProperties (Join-Path $pkg "xbox_security.properties") -Force
 Copy-PackagedJre -JavaHome $jreSrc -PackageRelativeDir "jre" -SecurityPropertiesPath $xboxSecurityProperties
 Copy-PackagedJre -JavaHome $jre21Src -PackageRelativeDir "jre21" -SecurityPropertiesPath $xboxSecurityProperties
-Build-JavaSecurityRealpathPatch -JavaHome $jreSrc -OutputJar (Join-Path $pkg "java-base-security-realpath.jar") -WorkName "java_security_realpath_patch_current"
-Build-JavaSecurityRealpathPatch -JavaHome $jre21Src -OutputJar (Join-Path $pkg "java-base-security-realpath-21.jar") -WorkName "java_security_realpath_patch_21"
+Build-JavaBaseUwpFilesystemPatch -JavaHome $jreSrc -OutputJar (Join-Path $pkg "java-base-uwp-filesystem.jar") -WorkName "java_base_uwp_filesystem_patch_current"
+Build-JavaBaseUwpFilesystemPatch -JavaHome $jre21Src -OutputJar (Join-Path $pkg "java-base-uwp-filesystem-21.jar") -WorkName "java_base_uwp_filesystem_patch_21"
 Build-JavaZipfsRealpathPatch -JavaHome $jreSrc -OutputJar (Join-Path $pkg "java-zipfs-realpath.jar") -WorkName "java_zipfs_realpath_patch_current"
 Build-JavaZipfsRealpathPatch -JavaHome $jre21Src -OutputJar (Join-Path $pkg "java-zipfs-realpath-21.jar") -WorkName "java_zipfs_realpath_patch_21"
 
