@@ -35,8 +35,10 @@ $nativesSourceDir = Get-ConfigPath "NativesDir"
 $certDir = Get-ConfigPath "CertificateDir"
 $mcBuildDir = Join-Path $buildDir "MC.Xbox"
 $glfwBuildDir = Join-Path $buildDir "glfw_shim"
+$xboxOneGlProxyBuildDir = Join-Path $buildDir "xboxone_gl_proxy"
 $mcExe = Join-Path $mcBuildDir "MC.Xbox.exe"
 $shimDll = Join-Path $glfwBuildDir "glfw.dll"
+$xboxOneGlProxyDll = Join-Path $xboxOneGlProxyBuildDir "opengl32.dll"
 $jreSrc = Resolve-JavaHome
 $jre21Src = Resolve-JavaHomeExact -MajorVersion 21
 $jarExe = Join-Path $jreSrc "bin\jar.exe"
@@ -326,6 +328,11 @@ Write-Host "MC.Xbox.exe built"
 
 Write-Host "=== Building GLFW CoreWindow shim ==="
 & (Join-Path $root "glfw_shim\build_glfw.ps1") -OutputDir $glfwBuildDir
+if (-not (Test-Path $shimDll)) { throw "GLFW shim DLL missing after build: $shimDll" }
+
+Write-Host "=== Building Xbox One OpenGL proxy ==="
+& (Join-Path $root "xboxone_gl_proxy\build_proxy.ps1") -OutputDir $xboxOneGlProxyBuildDir
+if (-not (Test-Path $xboxOneGlProxyDll)) { throw "Xbox One OpenGL proxy DLL missing after build: $xboxOneGlProxyDll" }
 
 Write-Host "=== Building Xbox compatibility mod ==="
 & (Join-Path $root "compat_mod\build_compat_mod.ps1")
@@ -527,12 +534,24 @@ $xboxOneRuntime = Resolve-XboxOneGraphicsRuntimeDir -XboxOneGraphicsRuntimeDir $
 if ($xboxOneRuntime) {
     Write-Host "Xbox One graphics runtime source: $xboxOneRuntime"
     foreach ($dll in Get-XboxOneGraphicsRuntimeDllNames) {
+        if ($dll -eq "opengl32.dll") { continue }
         $source = Join-Path $xboxOneRuntime $dll
         if (Test-Path $source) {
             Copy-Item $source (Join-Path $pkg "graphics\xboxone\$dll") -Force
             Write-Host "Xbox One graphics: $dll"
         }
     }
+    $mobileGluesSource = Join-Path $xboxOneRuntime "mobileglues.dll"
+    if (-not (Test-Path $mobileGluesSource)) {
+        $mobileGluesSource = Join-Path $xboxOneRuntime "opengl32.dll"
+    }
+    if (-not (Test-Path $mobileGluesSource)) {
+        throw "Xbox One MobileGlues binary missing. Expected mobileglues.dll or opengl32.dll in $xboxOneRuntime"
+    }
+    Copy-Item $mobileGluesSource (Join-Path $pkg "graphics\xboxone\mobileglues.dll") -Force
+    Write-Host "Xbox One graphics: mobileglues.dll"
+    Copy-Item $xboxOneGlProxyDll (Join-Path $pkg "graphics\xboxone\opengl32.dll") -Force
+    Write-Host "Xbox One graphics: opengl32.dll proxy"
 } else {
     $partialXboxOneRuntime = @($XboxOneGraphicsRuntimeDir, $env:XBOX_ONE_GRAPHICS_RUNTIME_DIR, (Get-ConfigPath "XboxOneGraphicsRuntimeDir")) |
         Where-Object { $_ -and (Test-Path $_) } |

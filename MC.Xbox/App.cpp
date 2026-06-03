@@ -262,6 +262,266 @@ static bool WriteTextFile(const std::wstring& path, const std::wstring& value) {
     return ok;
 }
 
+static std::wstring CrashLaunchMarkerPath(const std::wstring& runtimeRoot) {
+    return runtimeRoot + L"\\.minecraft_launch_active";
+}
+
+static std::wstring CrashReportsDir(const std::wstring& runtimeRoot) {
+    return runtimeRoot + L"\\game\\crash-reports";
+}
+
+static std::wstring CrashTimestampForFileName() {
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    wchar_t stamp[32] = {};
+    swprintf_s(stamp, L"%04u%02u%02u-%02u%02u%02u",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return stamp;
+}
+
+struct CrashZipEntry {
+    std::string name;
+    std::vector<unsigned char> data;
+    mz_uint32 crc = 0;
+    mz_uint32 localHeaderOffset = 0;
+};
+
+static bool ReadBinaryFileLimited(
+    const std::wstring& path,
+    std::vector<unsigned char>& out,
+    unsigned long long maxBytes = 64ull * 1024ull * 1024ull) {
+    int fd = -1;
+    errno_t openErr = _wsopen_s(&fd, path.c_str(), _O_RDONLY | _O_BINARY, _SH_DENYNO, _S_IREAD);
+    if (openErr != 0 || fd < 0) return false;
+
+    const __int64 size = _filelengthi64(fd);
+    if (size < 0 || static_cast<unsigned long long>(size) > maxBytes) {
+        _close(fd);
+        return false;
+    }
+
+    out.resize(static_cast<size_t>(size));
+    size_t offset = 0;
+    while (offset < out.size()) {
+        const unsigned remaining = static_cast<unsigned>(std::min<size_t>(out.size() - offset, 1024u * 1024u));
+        const int read = _read(fd, out.data() + offset, remaining);
+        if (read <= 0) {
+            _close(fd);
+            out.clear();
+            return false;
+        }
+        offset += static_cast<size_t>(read);
+    }
+
+    _close(fd);
+    return true;
+}
+
+static void AddCrashZipMemoryEntry(
+    std::vector<CrashZipEntry>& entries,
+    const std::string& name,
+    const std::string& text) {
+    if (name.empty() || name.size() > 65535) return;
+    CrashZipEntry entry;
+    entry.name = name;
+    entry.data.assign(text.begin(), text.end());
+    entry.crc = static_cast<mz_uint32>(mz_crc32(MZ_CRC32_INIT, entry.data.data(), entry.data.size()));
+    entries.push_back(std::move(entry));
+}
+
+static void AddCrashZipFileEntry(
+    std::vector<CrashZipEntry>& entries,
+    const std::wstring& path,
+    const std::string& archiveName) {
+    if (archiveName.empty() || archiveName.size() > 65535) return;
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return;
+
+    CrashZipEntry entry;
+    entry.name = archiveName;
+    if (!ReadBinaryFileLimited(path, entry.data)) return;
+    entry.crc = static_cast<mz_uint32>(mz_crc32(MZ_CRC32_INIT, entry.data.data(), entry.data.size()));
+    entries.push_back(std::move(entry));
+}
+
+static void AddCrashZipMatchingFiles(
+    std::vector<CrashZipEntry>& entries,
+    const std::wstring& dir,
+    const std::wstring& pattern,
+    const std::string& archivePrefix) {
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW((dir + L"\\" + pattern).c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        AddCrashZipFileEntry(entries, dir + L"\\" + fd.cFileName, archivePrefix + "/" + w2a(fd.cFileName));
+    } while (FindNextFileW(h, &fd));
+
+    FindClose(h);
+}
+
+static bool ZipWrite(FILE* f, const void* data, size_t size) {
+    return size == 0 || fwrite(data, 1, size, f) == size;
+}
+
+static bool ZipWriteLe16(FILE* f, unsigned value) {
+    unsigned char bytes[2] = {
+        static_cast<unsigned char>(value & 0xFFu),
+        static_cast<unsigned char>((value >> 8) & 0xFFu)
+    };
+    return ZipWrite(f, bytes, sizeof(bytes));
+}
+
+static bool ZipWriteLe32(FILE* f, unsigned long value) {
+    unsigned char bytes[4] = {
+        static_cast<unsigned char>(value & 0xFFul),
+        static_cast<unsigned char>((value >> 8) & 0xFFul),
+        static_cast<unsigned char>((value >> 16) & 0xFFul),
+        static_cast<unsigned char>((value >> 24) & 0xFFul)
+    };
+    return ZipWrite(f, bytes, sizeof(bytes));
+}
+
+static bool WriteStoredZip(const std::wstring& zipPath, std::vector<CrashZipEntry>& entries) {
+    if (entries.empty()) return false;
+    EnsureDirectoryTree(GetParentDir(zipPath));
+
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, zipPath.c_str(), L"wb") != 0 || !f) return false;
+
+    bool ok = true;
+    for (CrashZipEntry& entry : entries) {
+        const __int64 offset = _ftelli64(f);
+        if (offset < 0 || offset > 0xFFFFFFFFll || entry.data.size() > 0xFFFFFFFFull) {
+            ok = false;
+            break;
+        }
+        entry.localHeaderOffset = static_cast<mz_uint32>(offset);
+        const unsigned nameLen = static_cast<unsigned>(entry.name.size());
+        const unsigned dataLen = static_cast<unsigned>(entry.data.size());
+
+        ok = ok &&
+            ZipWriteLe32(f, 0x04034b50ul) &&
+            ZipWriteLe16(f, 20) &&
+            ZipWriteLe16(f, 0x0800) &&
+            ZipWriteLe16(f, 0) &&
+            ZipWriteLe16(f, 0) &&
+            ZipWriteLe16(f, 0) &&
+            ZipWriteLe32(f, entry.crc) &&
+            ZipWriteLe32(f, dataLen) &&
+            ZipWriteLe32(f, dataLen) &&
+            ZipWriteLe16(f, nameLen) &&
+            ZipWriteLe16(f, 0) &&
+            ZipWrite(f, entry.name.data(), entry.name.size()) &&
+            ZipWrite(f, entry.data.data(), entry.data.size());
+        if (!ok) break;
+    }
+
+    const __int64 cdStart = _ftelli64(f);
+    if (ok && (cdStart < 0 || cdStart > 0xFFFFFFFFll)) ok = false;
+
+    for (const CrashZipEntry& entry : entries) {
+        const unsigned nameLen = static_cast<unsigned>(entry.name.size());
+        const unsigned dataLen = static_cast<unsigned>(entry.data.size());
+        ok = ok &&
+            ZipWriteLe32(f, 0x02014b50ul) &&
+            ZipWriteLe16(f, 20) &&
+            ZipWriteLe16(f, 20) &&
+            ZipWriteLe16(f, 0x0800) &&
+            ZipWriteLe16(f, 0) &&
+            ZipWriteLe16(f, 0) &&
+            ZipWriteLe16(f, 0) &&
+            ZipWriteLe32(f, entry.crc) &&
+            ZipWriteLe32(f, dataLen) &&
+            ZipWriteLe32(f, dataLen) &&
+            ZipWriteLe16(f, nameLen) &&
+            ZipWriteLe16(f, 0) &&
+            ZipWriteLe16(f, 0) &&
+            ZipWriteLe16(f, 0) &&
+            ZipWriteLe16(f, 0) &&
+            ZipWriteLe32(f, 0) &&
+            ZipWriteLe32(f, entry.localHeaderOffset) &&
+            ZipWrite(f, entry.name.data(), entry.name.size());
+        if (!ok) break;
+    }
+
+    const __int64 cdEnd = _ftelli64(f);
+    if (ok && (cdEnd < cdStart || cdEnd > 0xFFFFFFFFll)) ok = false;
+    const unsigned long cdSize = ok ? static_cast<unsigned long>(cdEnd - cdStart) : 0;
+    const unsigned long cdOffset = ok ? static_cast<unsigned long>(cdStart) : 0;
+    const unsigned count = static_cast<unsigned>(entries.size());
+
+    ok = ok &&
+        count <= 0xFFFFu &&
+        ZipWriteLe32(f, 0x06054b50ul) &&
+        ZipWriteLe16(f, 0) &&
+        ZipWriteLe16(f, 0) &&
+        ZipWriteLe16(f, count) &&
+        ZipWriteLe16(f, count) &&
+        ZipWriteLe32(f, cdSize) &&
+        ZipWriteLe32(f, cdOffset) &&
+        ZipWriteLe16(f, 0);
+
+    fclose(f);
+    if (!ok) {
+        DeleteFileW(zipPath.c_str());
+    }
+    return ok;
+}
+
+static bool CreateCrashReportZip(const std::wstring& runtimeRoot, const std::wstring& reason) {
+    const std::wstring gameDir = runtimeRoot + L"\\game";
+    const std::wstring reportsDir = CrashReportsDir(runtimeRoot);
+    EnsureDirectoryTree(reportsDir);
+
+    std::vector<CrashZipEntry> entries;
+    std::wstring markerText;
+    ReadTextFile(CrashLaunchMarkerPath(runtimeRoot), markerText);
+
+    std::string summary =
+        "Bandit Launcher crash report\n"
+        "reason=" + w2a(reason) + "\n"
+        "runtimeRoot=" + w2a(runtimeRoot) + "\n"
+        "created=" + w2a(CrashTimestampForFileName()) + "\n";
+    if (!markerText.empty()) {
+        summary += "\nlaunch marker:\n" + w2a(markerText) + "\n";
+    }
+    AddCrashZipMemoryEntry(entries, "summary.txt", summary);
+
+    AddCrashZipFileEntry(entries, runtimeRoot + L"\\mc_launch.log", "launcher/mc_launch.log");
+    AddCrashZipFileEntry(entries, runtimeRoot + L"\\java_output.log", "launcher/java_output.log");
+    AddCrashZipFileEntry(entries, runtimeRoot + L"\\stderr_stream.log", "launcher/stderr_stream.log");
+    AddCrashZipFileEntry(entries, runtimeRoot + L"\\glfw_uwp.log", "launcher/glfw_uwp.log");
+    AddCrashZipFileEntry(entries, runtimeRoot + L"\\xboxone_gl_proxy.log", "launcher/xboxone_gl_proxy.log");
+    AddCrashZipFileEntry(entries, runtimeRoot + L"\\java_args.txt", "launcher/java_args.txt");
+    AddCrashZipFileEntry(entries, gameDir + L"\\logs\\latest.log", "game/logs/latest.log");
+    AddCrashZipFileEntry(entries, gameDir + L"\\logs\\fabric-loader.log", "game/logs/fabric-loader.log");
+    AddCrashZipFileEntry(entries, gameDir + L"\\xbox_compat.log", "game/xbox_compat.log");
+    AddCrashZipMatchingFiles(entries, gameDir, L"hs_err_pid*.log", "game");
+    AddCrashZipMatchingFiles(entries, reportsDir, L"*.txt", "game/crash-reports");
+
+    const std::wstring zipPath = reportsDir + L"\\BanditLauncher-crash-" + CrashTimestampForFileName() + L".zip";
+    const bool ok = WriteStoredZip(zipPath, entries);
+    if (ok) {
+        WriteTextFile(runtimeRoot + L"\\last_crash_report.txt", zipPath + L"\n");
+        WriteLogF(L"Crash report zip written: %s entries=%zu", zipPath.c_str(), entries.size());
+    } else {
+        WriteLogF(L"Crash report zip failed: %s entries=%zu", zipPath.c_str(), entries.size());
+    }
+    return ok;
+}
+
+static void ArchivePreviousCrashIfNeeded(const std::wstring& runtimeRoot) {
+    const std::wstring markerPath = CrashLaunchMarkerPath(runtimeRoot);
+    if (GetFileAttributesW(markerPath.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+
+    WriteLog(L"Previous Minecraft launch marker found; archiving logs before truncation");
+    CreateCrashReportZip(runtimeRoot, L"Previous Minecraft launch did not exit cleanly");
+    DeleteFileW(markerPath.c_str());
+}
+
 static std::wstring RuntimeSeedStamp(const std::wstring& packageDir) {
     return std::wstring(L"seedVersion=4\n") +
         L"packageDir=" + packageDir + L"\n" +
@@ -7879,6 +8139,12 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     }
 
     WriteLog(L"Invoking KnotClient.main via embedded JVM");
+    WriteTextFile(CrashLaunchMarkerPath(exeDir),
+        std::wstring(L"minecraftVersion=") + minecraftVersion + L"\n" +
+        L"launchVersion=" + launchVersion + L"\n" +
+        L"jreDir=" + jreDir + L"\n" +
+        L"gameDir=" + gameDir + L"\n" +
+        L"nativesDir=" + nativesDir + L"\n");
     std::atomic<bool> javaMainRunning{ true };
     std::thread javaMainWatchdog([&javaMainRunning, vm]() {
         unsigned seconds = 0;
@@ -7904,6 +8170,9 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         LogTextFileTail(javaLog, L"java_output.log");
         LogTextFileTail(stderrLogPath, L"stderr_stream.log");
         WriteLog(L"Embedded JVM failed after startup; terminating host process to avoid JVM/native reuse");
+        StopLogTailers();
+        CreateCrashReportZip(exeDir, L"Java exception after Minecraft startup");
+        DeleteFileW(CrashLaunchMarkerPath(exeDir).c_str());
         ExitProcess(1);
         return false;
     }
@@ -7911,6 +8180,8 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     WriteLog(L"KnotClient.main returned");
     g_minecraftRunning.store(false);
     WriteLog(L"Minecraft exited; terminating host process to avoid JVM/native reuse on relaunch");
+    StopLogTailers();
+    DeleteFileW(CrashLaunchMarkerPath(exeDir).c_str());
     ExitProcess(0);
     return true;
 }
@@ -8028,6 +8299,7 @@ public:
 
         wchar_t lp[MAX_PATH];
         swprintf_s(lp, L"%s\\mc_launch.log", exeDir.c_str());
+        ArchivePreviousCrashIfNeeded(exeDir);
         FILE* clf = nullptr;
         _wfopen_s(&clf, lp, L"w");
         if (clf) fclose(clf);
