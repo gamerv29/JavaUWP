@@ -6623,18 +6623,83 @@ static bool AnyVirtualKeyDown(ICoreWindow* window, std::initializer_list<ABI::Wi
     return false;
 }
 
-static const wchar_t* kRecommendedSlugs[] = {
-    L"sodium", L"modernfix", L"ferrite-core", L"c2me-fabric", L"scalablelux",
-    L"asyncparticles", L"controlify", L"mcwifipnp", L"fpsdisplay", L"modmenu"
-};
+static std::vector<std::wstring> RecommendedSlugsForTarget(const LaunchTarget& target) {
+    const std::string version = w2a(target.minecraftVersion);
+    std::wstring loader = target.loader;
+    std::transform(loader.begin(), loader.end(), loader.begin(),
+        [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+    if (loader != L"fabric") {
+        return {};
+    }
 
-static bool FetchRecommendedMods(const std::wstring& runtimeRoot, std::vector<ModCard>& out, std::wstring& error) {
+    if (CompareVersionNumbers(version, "1.20.1") >= 0) {
+        return {
+            L"sodium",
+            L"modernfix",
+            L"ferrite-core",
+            L"c2me-fabric",
+            L"scalablelux",
+            L"asyncparticles",
+            L"controlify",
+            L"mcwifipnp",
+            L"fpsdisplay",
+            L"modmenu"
+        };
+    }
+
+    return {
+        L"sodium",
+        L"modernfix",
+        L"ferrite-core",
+        L"lithium",
+        L"starlight",
+        L"krypton",
+        L"lambdynamiclights",
+        L"fpsdisplay",
+        L"modmenu"
+    };
+}
+
+static bool ModrinthProjectHasTargetVersion(const std::wstring& projectIdOrSlug, const std::string& gameVersion, const std::string& loaderId) {
+    using namespace winrt::Windows::Data::Json;
+    if (projectIdOrSlug.empty() || gameVersion.empty()) return false;
+
+    const std::string versions = FormUrlEncode("[\"" + gameVersion + "\"]");
+    const std::wstring url =
+        L"https://api.modrinth.com/v2/project/" + a2w(FormUrlEncode(w2a(projectIdOrSlug)).c_str()) +
+        L"/version?" +
+        (loaderId.empty() ? std::wstring() : (L"loaders=" + a2w(FormUrlEncode("[\"" + loaderId + "\"]").c_str()) + L"&")) +
+        L"game_versions=" + a2w(versions.c_str());
+
+    const HttpResult response = HttpGetString(url.c_str());
+    if (!response.success()) {
+        WriteLogF(L"Recommended version check failed HTTP %d project=%s url=%s",
+            response.status,
+            projectIdOrSlug.c_str(),
+            url.c_str());
+        return false;
+    }
+
+    try {
+        return JsonArray::Parse(winrt::to_hstring(response.body)).Size() > 0;
+    } catch (...) {
+        WriteLogF(L"Recommended version check parse failed project=%s", projectIdOrSlug.c_str());
+        return false;
+    }
+}
+
+static bool FetchRecommendedMods(const std::wstring& runtimeRoot, const LaunchTarget& target, std::vector<ModCard>& out, std::wstring& error) {
     using namespace winrt::Windows::Data::Json;
     error.clear();
 
+    const std::vector<std::wstring> recommendedSlugs = RecommendedSlugsForTarget(target);
+    if (recommendedSlugs.empty()) {
+        return true;
+    }
+
     std::string ids = "[";
     bool first = true;
-    for (const wchar_t* slug : kRecommendedSlugs) {
+    for (const std::wstring& slug : recommendedSlugs) {
         if (!first) ids += ",";
         first = false;
         ids += "\"" + w2a(slug) + "\"";
@@ -6678,12 +6743,24 @@ static bool FetchRecommendedMods(const std::wstring& runtimeRoot, std::vector<Mo
         return false;
     }
 
-    for (const wchar_t* slug : kRecommendedSlugs) {
+    const std::string gameVersion = w2a(target.minecraftVersion);
+    const std::string loaderId = ModrinthLoaderId(target.loader);
+    for (const std::wstring& slug : recommendedSlugs) {
         std::wstring key = slug;
         std::transform(key.begin(), key.end(), key.begin(),
             [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
         auto it = bySlug.find(key);
-        if (it != bySlug.end()) out.push_back(it->second);
+        if (it == bySlug.end()) continue;
+
+        const std::wstring projectKey = it->second.projectId.empty() ? it->second.slug : it->second.projectId;
+        if (!ModrinthProjectHasTargetVersion(projectKey, gameVersion, loaderId)) {
+            WriteLogF(L"Recommended mod hidden for target=%s project=%s slug=%s",
+                target.targetId.c_str(),
+                projectKey.c_str(),
+                it->second.slug.c_str());
+            continue;
+        }
+        out.push_back(it->second);
     }
     return true;
 }
@@ -6768,7 +6845,8 @@ static void LoadModsTab(AuthUiState& state, const std::wstring& runtimeRoot, con
     if (state.selectedModsTab == 3) {
         std::vector<ModCard> all;
         std::wstring error;
-        if (!FetchRecommendedMods(runtimeRoot, all, error)) {
+        const LaunchTarget modsTarget = CurrentModsTarget(state);
+        if (!FetchRecommendedMods(runtimeRoot, modsTarget, all, error)) {
             state.status = error.empty() ? L"Could not load recommended" : error;
             state.isError = true;
             return;
@@ -8381,6 +8459,31 @@ static std::wstring JavaObjectToWideString(JNIEnv* env, jobject object) {
     return wide;
 }
 
+static bool CheckAndClearReturnToLauncherSignal(JNIEnv* env, const wchar_t* stage) {
+    if (!env || !env->ExceptionCheck()) return false;
+
+    jthrowable throwable = env->ExceptionOccurred();
+    env->ExceptionClear();
+    if (!throwable) {
+        return false;
+    }
+
+    const std::wstring exceptionText = JavaObjectToWideString(env, throwable);
+    const bool isReturnSignal =
+        exceptionText.find(L"BanditVaultReturnToLauncher") != std::wstring::npos ||
+        exceptionText.find(L"ReturnToLauncherSignal") != std::wstring::npos;
+
+    if (isReturnSignal) {
+        WriteLogF(L"Java return-to-launcher signal during %s: %s", stage, exceptionText.c_str());
+        env->DeleteLocalRef(throwable);
+        return true;
+    }
+
+    env->Throw(throwable);
+    env->DeleteLocalRef(throwable);
+    return false;
+}
+
 static void DumpJavaThreadStacks(JavaVM* vm, const wchar_t* reason) {
     if (!vm) return;
 
@@ -8799,6 +8902,15 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         javaMainWatchdog.join();
     }
 
+    if (CheckAndClearReturnToLauncherSignal(env, L"CallStaticVoidMethod(main)")) {
+        LogTextFileTail(javaLog, L"java_output.log");
+        LogTextFileTail(stderrLogPath, L"stderr_stream.log");
+        WriteLog(L"Minecraft requested return to launcher");
+        StopLogTailers();
+        DeleteFileW(CrashLaunchMarkerPath(exeDir).c_str());
+        return true;
+    }
+
     if (CheckAndLogJavaException(env, L"CallStaticVoidMethod(main)")) {
         LogTextFileTail(javaLog, L"java_output.log");
         LogTextFileTail(stderrLogPath, L"stderr_stream.log");
@@ -8812,10 +8924,9 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
 
     WriteLog(L"KnotClient.main returned");
     g_minecraftRunning.store(false);
-    WriteLog(L"Minecraft exited; terminating host process to avoid JVM/native reuse on relaunch");
+    WriteLog(L"Minecraft exited normally; returning to launcher menu");
     StopLogTailers();
     DeleteFileW(CrashLaunchMarkerPath(exeDir).c_str());
-    ExitProcess(0);
     return true;
 }
 
@@ -8955,6 +9066,7 @@ public:
             }
         }
 
+        for (;;) {
         bool repairDownloads = false;
         LaunchAuthConfig authConfig;
         while (true) {
@@ -9008,7 +9120,7 @@ public:
                 (TargetProfileText(selectedTarget) + L" is cataloged, but its launch provider is not implemented yet").c_str(),
                 1.0f);
             SleepWithAuthUi(unsupportedRenderer, unsupportedState, 8000);
-            return E_FAIL;
+            continue;
         }
 
         if (exeDir != packageDir && !IsLocalRuntimeSeedCurrent(packageDir, exeDir)) {
@@ -9205,9 +9317,24 @@ public:
                 authConfig)) {
             g_minecraftRunning.store(false);
             WriteLog(L"Embedded JVM launch failed");
-            return E_FAIL;
+            AuthScreenRenderer failedRendererInstance;
+            AuthScreenRenderer* failedRenderer = nullptr;
+            if (failedRendererInstance.Initialize(g_authWindow.Get())) {
+                failedRenderer = &failedRendererInstance;
+            }
+            AuthUiState failedState;
+            RenderPreparationProgress(
+                failedRenderer,
+                failedState,
+                L"Launch failed",
+                L"Minecraft could not start. Check logs for details.",
+                1.0f);
+            SleepWithAuthUi(failedRenderer, failedState, 6000);
+            continue;
         }
         g_minecraftRunning.store(false);
+        WriteLog(L"Minecraft session ended; returning to main menu");
+        }
         return S_OK;
     }
 

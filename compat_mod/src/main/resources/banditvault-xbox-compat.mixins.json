@@ -10,6 +10,7 @@
     "BanditControllerRecipeBookScreenMixin",
     "BanditControllerScreenMixin",
     "CobblemonShowdownFileSystemMixin",
+    "MinecraftClientExitMixin",
     "MinecraftClientProbeMixin",
     "PathUtilBypassMixin",
     "SystemDetailsOshiBypassMixin",
