@@ -1,5 +1,7 @@
 param(
     [string]$MinecraftVersion,
+    [string]$Loader,
+    [string]$LoaderVersion,
     [string]$FabricLoaderVersion,
     [string]$OutputPath
 )
@@ -11,16 +13,43 @@ $ErrorActionPreference = "Stop"
 if (-not $MinecraftVersion) {
     $MinecraftVersion = $ProjectConfig.MinecraftVersion
 }
-if (-not $FabricLoaderVersion) {
+if (-not $Loader) {
+    $Loader = "fabric"
+}
+$Loader = $Loader.ToLowerInvariant()
+if (-not $LoaderVersion -and $FabricLoaderVersion) {
+    $LoaderVersion = $FabricLoaderVersion
+}
+if (-not $LoaderVersion) {
     $FabricLoaderVersion = $ProjectConfig.FabricLoaderVersion
+    $LoaderVersion = $FabricLoaderVersion
+}
+if (-not $FabricLoaderVersion) {
+    $FabricLoaderVersion = $LoaderVersion
 }
 if (-not $OutputPath) {
     $OutputPath = Join-Path (Get-ConfigPath "PackageContentDir") "download_manifest.tsv"
 }
 
 function Get-Json([string]$Url) {
-    Write-Host "Fetch $Url"
-    return Invoke-RestMethod -UseBasicParsing -Uri $Url -TimeoutSec 60
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        try {
+            if ($attempt -eq 1) {
+                Write-Host "Fetch $Url"
+            } else {
+                Write-Host "Fetch $Url (retry $attempt)"
+            }
+            return Invoke-RestMethod -UseBasicParsing -Uri $Url -TimeoutSec 60
+        } catch {
+            $lastError = $_
+            if ($attempt -ge 4) {
+                break
+            }
+            Start-Sleep -Seconds ([Math]::Min(2 * $attempt, 6))
+        }
+    }
+    throw $lastError
 }
 
 function Convert-MavenNameToPath([string]$Name) {
@@ -145,6 +174,262 @@ function Add-FabricLibraries($FabricProfile, [System.Collections.Generic.List[ob
     }
 }
 
+function Add-LoaderLibraries($LoaderProfile, [System.Collections.Generic.List[object]]$Entries, [string]$DefaultBaseUrl) {
+    foreach ($library in $LoaderProfile.libraries) {
+        if (-not (Test-LibraryAllowed $library)) {
+            continue
+        }
+
+        if ($library.downloads.artifact) {
+            $artifact = $library.downloads.artifact
+            Add-Entry $Entries "game/libraries/$($artifact.path)" $artifact.sha1 ([UInt64]$artifact.size) $artifact.url
+            continue
+        }
+
+        $path = Convert-MavenNameToPath $library.name
+        $baseUrl = if ($library.url) { $library.url } else { $DefaultBaseUrl }
+        if (-not $baseUrl.EndsWith("/")) {
+            $baseUrl += "/"
+        }
+
+        $url = "$baseUrl$path"
+        $sha1 = if ($library.sha1) { $library.sha1 } else { Get-RemoteTextOrEmpty "$url.sha1" }
+        $size = if ($library.size) { [UInt64]$library.size } else { Get-RemoteSizeOrZero $url }
+        Add-Entry $Entries "game/libraries/$path" $sha1 $size $url
+    }
+}
+
+function Get-ZipJson([string]$JarPath, [string]$EntryName) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($JarPath)
+    try {
+        $entry = $zip.GetEntry($EntryName)
+        if (-not $entry) {
+            throw "$EntryName not found in $JarPath"
+        }
+        $reader = [System.IO.StreamReader]::new($entry.Open())
+        try {
+            return $reader.ReadToEnd() | ConvertFrom-Json
+        } finally {
+            $reader.Dispose()
+        }
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+function Save-ZipEntry([string]$JarPath, [string]$EntryName, [string]$OutputPath) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($JarPath)
+    try {
+        $entry = $zip.GetEntry($EntryName)
+        if (-not $entry) {
+            throw "$EntryName not found in $JarPath"
+        }
+        New-Item -ItemType Directory -Force -Path (Split-Path $OutputPath -Parent) | Out-Null
+        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $OutputPath, $true)
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+function Add-InstallerMavenEntries(
+    [string]$JarPath,
+    [string]$BaseUrl,
+    [System.Collections.Generic.List[object]]$Entries) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if (-not $BaseUrl.EndsWith("/")) {
+        $BaseUrl += "/"
+    }
+
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($JarPath)
+    try {
+        foreach ($entry in $zip.Entries) {
+            if (-not $entry.FullName.StartsWith("maven/") -or -not $entry.FullName.EndsWith(".jar")) {
+                continue
+            }
+
+            $path = $entry.FullName.Substring("maven/".Length)
+            $url = "$BaseUrl$path"
+            $sha1 = Get-RemoteTextOrEmpty "$url.sha1"
+            Add-Entry $Entries "game/libraries/$path" $sha1 ([UInt64]$entry.Length) $url
+        }
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+function Convert-ArgumentArrayToList($Arguments) {
+    $out = @()
+    if (-not $Arguments) {
+        return @()
+    }
+
+    foreach ($arg in $Arguments) {
+        if ($arg -is [string]) {
+            $out += $arg
+            continue
+        }
+
+        if ($arg.value) {
+            if ($arg.value -is [array]) {
+                foreach ($value in $arg.value) {
+                    $out += [string]$value
+                }
+            } else {
+                $out += [string]$arg.value
+            }
+        }
+    }
+    return $out
+}
+
+function Convert-JvmArgsForEmbeddedJvm($Values) {
+    $out = @()
+    for ($i = 0; $i -lt $Values.Count; $i++) {
+        $arg = [string]$Values[$i]
+        if (($arg -eq "-p" -or $arg -eq "--module-path") -and ($i + 1) -lt $Values.Count) {
+            $out += "--module-path=$($Values[$i + 1])"
+            $i++
+            continue
+        }
+        if (($arg -eq "--add-modules" -or $arg -eq "--add-opens" -or $arg -eq "--add-exports") -and ($i + 1) -lt $Values.Count) {
+            $out += "$arg=$($Values[$i + 1])"
+            $i++
+            continue
+        }
+        $out += $arg
+    }
+    return $out
+}
+
+function Join-ManifestArgumentList($Values) {
+    return ($Values | Where-Object { $_ }) -join ([char]0x1f)
+}
+
+function Get-ForgeInstallerVersion([string]$MinecraftVersion, [string]$Version) {
+    if ($Version.StartsWith("$MinecraftVersion-")) {
+        return $Version
+    }
+    return "$MinecraftVersion-$Version"
+}
+
+function Get-LoaderProfile([string]$Loader, [string]$MinecraftVersion, [string]$LoaderVersion) {
+    if ($Loader -eq "fabric") {
+        return Get-Json "https://meta.fabricmc.net/v2/versions/loader/$MinecraftVersion/$LoaderVersion/profile/json"
+    }
+
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "MinecraftJavaUWP-loader-metadata"
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    if ($Loader -eq "forge") {
+        $forgeVersion = Get-ForgeInstallerVersion $MinecraftVersion $LoaderVersion
+        $jar = Join-Path $tmp "forge-$forgeVersion-installer.jar"
+        $url = "https://maven.minecraftforge.net/net/minecraftforge/forge/$forgeVersion/forge-$forgeVersion-installer.jar"
+        if (-not (Test-Path $jar)) {
+            Write-Host "Fetch $url"
+            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $jar -TimeoutSec 120
+        }
+        return Get-ZipJson $jar "version.json"
+    }
+
+    if ($Loader -eq "neoforge") {
+        $jar = Join-Path $tmp "neoforge-$LoaderVersion-installer.jar"
+        $url = "https://maven.neoforged.net/releases/net/neoforged/neoforge/$LoaderVersion/neoforge-$LoaderVersion-installer.jar"
+        if (-not (Test-Path $jar)) {
+            Write-Host "Fetch $url"
+            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $jar -TimeoutSec 120
+        }
+        return Get-ZipJson $jar "version.json"
+    }
+
+    if ($Loader -eq "vanilla") {
+        return $null
+    }
+
+    throw "Unsupported loader '$Loader'"
+}
+
+function Get-LoaderInstallProfile([string]$Loader, [string]$MinecraftVersion, [string]$LoaderVersion) {
+    if ($Loader -ne "forge" -and $Loader -ne "neoforge") {
+        return $null
+    }
+
+    $installerJar = Get-LoaderInstallerJarPath $Loader $MinecraftVersion $LoaderVersion
+    if ($installerJar -and (Test-Path $installerJar)) {
+        return Get-ZipJson $installerJar "install_profile.json"
+    }
+
+    return $null
+}
+
+function Get-LoaderInstallerJarPath([string]$Loader, [string]$MinecraftVersion, [string]$LoaderVersion) {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "MinecraftJavaUWP-loader-metadata"
+    if ($Loader -eq "forge") {
+        $forgeVersion = Get-ForgeInstallerVersion $MinecraftVersion $LoaderVersion
+        return Join-Path $tmp "forge-$forgeVersion-installer.jar"
+    }
+    if ($Loader -eq "neoforge") {
+        return Join-Path $tmp "neoforge-$LoaderVersion-installer.jar"
+    }
+    return $null
+}
+
+function Add-LoaderInstallerJarEntry(
+    [string]$Loader,
+    [string]$MinecraftVersion,
+    [string]$LoaderVersion,
+    [System.Collections.Generic.List[object]]$Entries) {
+    if ($Loader -eq "forge") {
+        $forgeVersion = Get-ForgeInstallerVersion $MinecraftVersion $LoaderVersion
+        $path = "net/minecraftforge/forge/$forgeVersion/forge-$forgeVersion-installer.jar"
+        $url = "https://maven.minecraftforge.net/$path"
+        $sha1 = Get-RemoteTextOrEmpty "$url.sha1"
+        $size = Get-RemoteSizeOrZero $url
+        Add-Entry $Entries "game/libraries/$path" $sha1 $size $url
+        return
+    }
+
+    if ($Loader -eq "neoforge") {
+        $path = "net/neoforged/neoforge/$LoaderVersion/neoforge-$LoaderVersion-installer.jar"
+        $url = "https://maven.neoforged.net/releases/$path"
+        $sha1 = Get-RemoteTextOrEmpty "$url.sha1"
+        $size = Get-RemoteSizeOrZero $url
+        Add-Entry $Entries "game/libraries/$path" $sha1 $size $url
+    }
+}
+
+function Get-GameArgumentValue($Arguments, [string]$Name) {
+    if (-not $Arguments) {
+        return ""
+    }
+
+    for ($i = 0; $i -lt $Arguments.Count - 1; $i++) {
+        if ([string]$Arguments[$i] -eq $Name) {
+            return [string]$Arguments[$i + 1]
+        }
+    }
+
+    return ""
+}
+
+function Get-LibraryVersion($Profile, [string]$Prefix) {
+    if (-not $Profile -or -not $Profile.libraries) {
+        return ""
+    }
+
+    foreach ($library in $Profile.libraries) {
+        $name = [string]$library.name
+        if ($name.StartsWith($Prefix)) {
+            $parts = $name.Split(":")
+            if ($parts.Length -ge 3) {
+                return $parts[2]
+            }
+        }
+    }
+
+    return ""
+}
+
 function Add-Assets($VersionJson, [System.Collections.Generic.List[object]]$Entries) {
     $assetIndex = $VersionJson.assetIndex
     Add-Entry $Entries "assets/indexes/$($assetIndex.id).json" $assetIndex.sha1 ([UInt64]$assetIndex.size) $assetIndex.url
@@ -165,13 +450,40 @@ if (-not $version) {
 }
 
 $versionJson = Get-Json $version.url
-$fabricProfile = Get-Json "https://meta.fabricmc.net/v2/versions/loader/$MinecraftVersion/$FabricLoaderVersion/profile/json"
+$loaderProfile = Get-LoaderProfile $Loader $MinecraftVersion $LoaderVersion
+$installProfile = Get-LoaderInstallProfile $Loader $MinecraftVersion $LoaderVersion
 
 $entries = [System.Collections.Generic.List[object]]::new()
 Add-Entry $entries "game/versions/$MinecraftVersion/$MinecraftVersion.json" $version.sha1 ([UInt64]0) $version.url
 Add-Entry $entries "game/versions/$MinecraftVersion/$MinecraftVersion.jar" $versionJson.downloads.client.sha1 ([UInt64]$versionJson.downloads.client.size) $versionJson.downloads.client.url
+if ($versionJson.downloads.client_mappings) {
+    $clientMappings = $versionJson.downloads.client_mappings
+    Add-Entry $entries "game/libraries/net/minecraft/client/$MinecraftVersion/client-$MinecraftVersion-mappings.txt" $clientMappings.sha1 ([UInt64]$clientMappings.size) $clientMappings.url
+}
 Add-MinecraftLibraries $versionJson $entries
-Add-FabricLibraries $fabricProfile $entries
+if ($Loader -eq "fabric") {
+    Add-FabricLibraries $loaderProfile $entries
+} elseif ($Loader -eq "forge") {
+    Add-LoaderLibraries $loaderProfile $entries "https://maven.minecraftforge.net/"
+    if ($installProfile) {
+        Add-LoaderLibraries $installProfile $entries "https://maven.minecraftforge.net/"
+    }
+    Add-LoaderInstallerJarEntry $Loader $MinecraftVersion $LoaderVersion $entries
+    $installerJar = Get-LoaderInstallerJarPath $Loader $MinecraftVersion $LoaderVersion
+    if ($installerJar -and (Test-Path $installerJar)) {
+        Add-InstallerMavenEntries $installerJar "https://maven.minecraftforge.net/" $entries
+    }
+} elseif ($Loader -eq "neoforge") {
+    Add-LoaderLibraries $loaderProfile $entries "https://maven.neoforged.net/releases/"
+    if ($installProfile) {
+        Add-LoaderLibraries $installProfile $entries "https://maven.neoforged.net/releases/"
+    }
+    Add-LoaderInstallerJarEntry $Loader $MinecraftVersion $LoaderVersion $entries
+    $installerJar = Get-LoaderInstallerJarPath $Loader $MinecraftVersion $LoaderVersion
+    if ($installerJar -and (Test-Path $installerJar)) {
+        Add-InstallerMavenEntries $installerJar "https://maven.neoforged.net/releases/" $entries
+    }
+}
 Add-Assets $versionJson $entries
 
 $deduped = $entries |
@@ -188,9 +500,43 @@ New-Item -ItemType Directory -Force -Path (Split-Path $OutputPath -Parent) | Out
 $lines = [System.Collections.Generic.List[string]]::new()
 $lines.Add("# MinecraftJavaUWP official download manifest")
 $lines.Add("# minecraftVersion`t$MinecraftVersion")
-$lines.Add("# fabricLoaderVersion`t$FabricLoaderVersion")
+$lines.Add("# loader`t$Loader")
+$lines.Add("# loaderVersion`t$LoaderVersion")
+if ($Loader -eq "fabric") {
+    $lines.Add("# fabricLoaderVersion`t$LoaderVersion")
+}
 $lines.Add("# assetIndex`t$($versionJson.assetIndex.id)")
-$lines.Add("# launchVersion`t$($fabricProfile.id)")
+$launchVersion = if ($loaderProfile -and $loaderProfile.PSObject.Properties["id"] -and $loaderProfile.PSObject.Properties["id"].Value) { $loaderProfile.PSObject.Properties["id"].Value } else { $MinecraftVersion }
+$mainClass = if ($loaderProfile -and $loaderProfile.PSObject.Properties["mainClass"] -and $loaderProfile.PSObject.Properties["mainClass"].Value) { $loaderProfile.PSObject.Properties["mainClass"].Value } else { $versionJson.mainClass }
+$jvmArgs = [System.Collections.Generic.List[string]]::new()
+$gameArgs = [System.Collections.Generic.List[string]]::new()
+$argumentsProperty = if ($loaderProfile -and $loaderProfile.PSObject.Properties["arguments"]) { $loaderProfile.PSObject.Properties["arguments"].Value } else { $null }
+if ($argumentsProperty -and $Loader -ne "fabric") {
+    $jvmArgs = Convert-JvmArgsForEmbeddedJvm (Convert-ArgumentArrayToList $argumentsProperty.jvm)
+    $gameArgs = Convert-ArgumentArrayToList $argumentsProperty.game
+}
+$lines.Add("# launchVersion`t$launchVersion")
+$lines.Add("# mainClass`t$mainClass")
+if ($jvmArgs.Count -gt 0) {
+    $lines.Add("# jvmArgs`t$(Join-ManifestArgumentList $jvmArgs)")
+}
+if ($gameArgs.Count -gt 0) {
+    $lines.Add("# gameArgs`t$(Join-ManifestArgumentList $gameArgs)")
+}
+if ($Loader -eq "neoforge") {
+    $neoFormVersion = Get-GameArgumentValue $gameArgs "--fml.neoFormVersion"
+    if ($neoFormVersion) {
+        $lines.Add("# neoFormVersion`t$neoFormVersion")
+    }
+    $installToolsVersion = Get-LibraryVersion $installProfile "net.neoforged.installertools:installertools:"
+    $jarSplitterVersion = Get-LibraryVersion $installProfile "net.neoforged.installertools:jarsplitter:"
+    $binaryPatcherVersion = Get-LibraryVersion $installProfile "net.neoforged.installertools:binarypatcher:"
+    $autoRenamingToolVersion = Get-LibraryVersion $installProfile "net.neoforged:AutoRenamingTool:"
+    if ($installToolsVersion) { $lines.Add("# neoForgeInstallToolsVersion`t$installToolsVersion") }
+    if ($jarSplitterVersion) { $lines.Add("# neoForgeJarSplitterVersion`t$jarSplitterVersion") }
+    if ($binaryPatcherVersion) { $lines.Add("# neoForgeBinaryPatcherVersion`t$binaryPatcherVersion") }
+    if ($autoRenamingToolVersion) { $lines.Add("# neoForgeAutoRenamingToolVersion`t$autoRenamingToolVersion") }
+}
 $lines.Add("# path`tsha1`tsize`turl")
 foreach ($entry in $deduped) {
     $lines.Add("$($entry.Path)`t$($entry.Sha1)`t$($entry.Size)`t$($entry.Url)")

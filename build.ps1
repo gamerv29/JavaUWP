@@ -10,7 +10,8 @@ param(
     [switch]$SkipStopAppProcesses,
     [switch]$StopFileLockers,
     [switch]$SkipVersionManifests,
-    [switch]$SkipVersionCompat
+    [switch]$SkipVersionCompat,
+    [switch]$IncludePrebuiltNeoForgeArtifacts
 )
 
 $ErrorActionPreference = "Stop"
@@ -369,6 +370,22 @@ if (-not (Test-Path $versionCatalogSource)) {
 Copy-Item $versionCatalogSource (Join-Path $pkg "runtime\version_catalog.tsv") -Force
 Write-Host "Version catalog: $versionCatalogSource"
 
+# NeoForge client jars are derived from the Minecraft client. Keep them out of normal and
+# nightly builds; opt in only for private diagnostics while on-device generation is being fixed.
+$prebuiltLibs = Join-Path $root "prebuilt\neoforge\libraries"
+if (($IncludePrebuiltNeoForgeArtifacts -or $env:BANDIT_INCLUDE_PREBUILT_NEOFORGE_ARTIFACTS -eq "1") -and (Test-Path $prebuiltLibs)) {
+    $prebuiltDst = Join-Path $pkg "runtime\libraries"
+    Get-ChildItem $prebuiltLibs -Recurse -File | ForEach-Object {
+        $rel = $_.FullName.Substring($prebuiltLibs.Length).TrimStart('\')
+        $dst = Join-Path $prebuiltDst $rel
+        New-Item -ItemType Directory -Force -Path (Split-Path $dst -Parent) | Out-Null
+        Copy-Item $_.FullName $dst -Force
+    }
+    Write-Host "Packaged prebuilt NeoForge client jars from $prebuiltLibs"
+} elseif (Test-Path $prebuiltLibs) {
+    Write-Host "Skipping prebuilt NeoForge client jars. Use -IncludePrebuiltNeoForgeArtifacts for private diagnostics."
+}
+
 function Ensure-FabricLoaderJar {
     param([Parameter(Mandatory = $true)][string]$LoaderVersion)
 
@@ -471,6 +488,10 @@ $fabricTargets = @(
     Import-Csv -Path $versionCatalogSource -Delimiter "`t" |
         Where-Object { $_.loader -eq "fabric" -and $_.loaderVersion -and $_.loaderVersion -ne "selected" -and $_.loaderVersion -ne "none" }
 )
+$manifestTargets = @(
+    Import-Csv -Path $versionCatalogSource -Delimiter "`t" |
+        Where-Object { $_.loader -and $_.loaderVersion -and $_.loaderVersion -ne "selected" -and $_.loaderVersion -ne "none" }
+)
 $fabricLoaderVersions = @($ProjectConfig.FabricLoaderVersion) + @($fabricTargets | ForEach-Object { $_.loaderVersion }) |
     Where-Object { $_ } |
     Select-Object -Unique
@@ -566,6 +587,8 @@ if ($xboxOneRuntime) {
 Write-Host "Generating official download manifest..."
 & (Join-Path $root "scripts\new-download-manifest.ps1") `
     -MinecraftVersion $ProjectConfig.MinecraftVersion `
+    -Loader "fabric" `
+    -LoaderVersion $ProjectConfig.FabricLoaderVersion `
     -FabricLoaderVersion $ProjectConfig.FabricLoaderVersion `
     -OutputPath (Join-Path $pkg "download_manifest.tsv")
 
@@ -576,16 +599,18 @@ Copy-Item -Force (Join-Path $pkg "download_manifest.tsv") (Join-Path $manifestsD
 Write-Host "Default per-version manifest: $defaultTargetId.tsv"
 
 if (-not $SkipVersionManifests) {
-    foreach ($row in $fabricTargets) {
+    foreach ($row in $manifestTargets) {
         $lv = $row.loaderVersion
-        $targetId = "$($row.minecraftVersion)-fabric-$lv"
+        $loader = $row.loader.ToLowerInvariant()
+        $targetId = "$($row.minecraftVersion)-$loader-$lv"
         if ($targetId -eq $defaultTargetId) { continue }
         $out = Join-Path $manifestsDir "$targetId.tsv"
-        Write-Host "Generating per-version manifest: $targetId (loader $lv)"
+        Write-Host "Generating per-version manifest: $targetId"
         try {
             & (Join-Path $root "scripts\new-download-manifest.ps1") `
                 -MinecraftVersion $row.minecraftVersion `
-                -FabricLoaderVersion $lv `
+                -Loader $loader `
+                -LoaderVersion $lv `
                 -OutputPath $out
         } catch {
             Write-Warning "Skipping ${targetId}: $($_.Exception.Message)"
@@ -838,6 +863,62 @@ function Build-JavaZipfsRealpathPatch {
     Write-Host "Java ZipFS patch: $OutputJar"
 }
 
+function Resolve-SecureJarHandlerJar {
+    param([Parameter(Mandatory = $true)][string]$Version)
+
+    $relative = "cpw\mods\securejarhandler\$Version\securejarhandler-$Version.jar"
+    $candidates = @(
+        (Join-Path $gameDir "libraries\$relative"),
+        (Join-Path $root ".local\pcgen\mc\libraries\$relative")
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            return (Resolve-Path $candidate).Path
+        }
+    }
+
+    $downloadPath = Join-Path $gameDir "libraries\$relative"
+    $url = "https://maven.neoforged.net/releases/cpw/mods/securejarhandler/$Version/securejarhandler-$Version.jar"
+    Write-Host "Downloading securejarhandler $Version"
+    New-Item -ItemType Directory -Force -Path (Split-Path $downloadPath -Parent) | Out-Null
+    Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $downloadPath -TimeoutSec 60
+    return (Resolve-Path $downloadPath).Path
+}
+
+function Build-SecureJarHandlerUwpPatch {
+    param(
+        [Parameter(Mandatory = $true)][string]$JavaHome,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$OutputJar
+    )
+
+    Write-Host "Building securejarhandler UWP patch: $OutputJar"
+    $javacExe = Join-Path $JavaHome "bin\javac.exe"
+    if (-not (Test-Path $javacExe)) { throw "javac.exe not found at $javacExe; securejarhandler patch requires a JDK." }
+    $runtimeJarExe = Join-Path $JavaHome "bin\jar.exe"
+    if (-not (Test-Path $runtimeJarExe)) { $runtimeJarExe = $jarExe }
+
+    $secureJar = Resolve-SecureJarHandlerJar -Version $Version
+    $patchSourceRoot = Join-Path $root "patch\securejarhandler"
+    $patchSources = @(Get-ChildItem -LiteralPath $patchSourceRoot -Recurse -Filter "*.java" | ForEach-Object { $_.FullName })
+    if ($patchSources.Count -eq 0) {
+        throw "securejarhandler patch sources missing: $patchSourceRoot"
+    }
+
+    $patchDir = Join-Path $buildDir "securejarhandler_uwp_patch\$Version"
+    $classesDir = Join-Path $patchDir "classes"
+    Remove-Item -Recurse -Force $patchDir -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $classesDir | Out-Null
+
+    & $javacExe --release 21 -cp $secureJar -d $classesDir $patchSources
+    if ($LASTEXITCODE -ne 0) { throw "securejarhandler UWP patch compile failed" }
+
+    & $runtimeJarExe cf $OutputJar -C $classesDir .
+    if ($LASTEXITCODE -ne 0) { throw "securejarhandler UWP patch jar creation failed" }
+    Write-Host "securejarhandler UWP patch: $OutputJar"
+}
+
 Write-Host "Copying JRE..."
 $xboxSecurityProperties = Join-Path $root "xbox_security.properties"
 Copy-Item $xboxSecurityProperties (Join-Path $pkg "xbox_security.properties") -Force
@@ -847,6 +928,7 @@ Build-JavaBaseUwpFilesystemPatch -JavaHome $jreSrc -OutputJar (Join-Path $pkg "j
 Build-JavaBaseUwpFilesystemPatch -JavaHome $jre21Src -OutputJar (Join-Path $pkg "java-base-uwp-filesystem-21.jar") -WorkName "java_base_uwp_filesystem_patch_21"
 Build-JavaZipfsRealpathPatch -JavaHome $jreSrc -OutputJar (Join-Path $pkg "java-zipfs-realpath.jar") -WorkName "java_zipfs_realpath_patch_current"
 Build-JavaZipfsRealpathPatch -JavaHome $jre21Src -OutputJar (Join-Path $pkg "java-zipfs-realpath-21.jar") -WorkName "java_zipfs_realpath_patch_21"
+Build-SecureJarHandlerUwpPatch -JavaHome $jre21Src -Version "3.0.8" -OutputJar (Join-Path $pkg "securejarhandler-uwp-patch.jar")
 
 Write-Host "Generating UWP tile assets..."
 & $pythonExe (Join-Path $root "scripts\generate-assets.py") $pkg

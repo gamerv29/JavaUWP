@@ -365,18 +365,35 @@ static void AddCrashZipMatchingFiles(
     std::vector<CrashZipEntry>& entries,
     const std::wstring& dir,
     const std::wstring& pattern,
-    const std::string& archivePrefix) {
+    const std::string& archivePrefix,
+    size_t newestLimit = 0) {
     WIN32_FIND_DATAW fd = {};
     HANDLE h = FindFirstFileW((dir + L"\\" + pattern).c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
 
+    struct Match {
+        std::wstring name;
+        FILETIME written;
+    };
+    std::vector<Match> matches;
     do {
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        AddCrashZipFileEntry(entries, dir + L"\\" + fd.cFileName, archivePrefix + "/" + w2a(fd.cFileName));
+        matches.push_back(Match{ fd.cFileName, fd.ftLastWriteTime });
     } while (FindNextFileW(h, &fd));
 
     FindClose(h);
+
+    if (newestLimit > 0 && matches.size() > newestLimit) {
+        std::sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) {
+            return CompareFileTime(&a.written, &b.written) > 0;
+        });
+        matches.resize(newestLimit);
+    }
+
+    for (const Match& match : matches) {
+        AddCrashZipFileEntry(entries, dir + L"\\" + match.name, archivePrefix + "/" + w2a(match.name));
+    }
 }
 
 static bool ZipWrite(FILE* f, const void* data, size_t size) {
@@ -520,7 +537,11 @@ static bool CreateCrashReportZip(const std::wstring& runtimeRoot, const std::wst
         "runtimeRoot=" + w2a(runtimeRoot) + "\n"
         "created=" + w2a(CrashTimestampForFileName()) + "\n";
     if (!markerText.empty()) {
-        summary += "\nlaunch marker:\n" + w2a(markerText) + "\n";
+        summary +=
+            "\nprevious launch marker:\n"
+            "# This describes the Minecraft run that failed to exit cleanly before this app start.\n"
+            "# It may not match the profile currently selected in the launcher UI.\n" +
+            w2a(markerText) + "\n";
     }
     AddCrashZipMemoryEntry(entries, "summary.txt", summary);
 
@@ -530,10 +551,14 @@ static bool CreateCrashReportZip(const std::wstring& runtimeRoot, const std::wst
     AddCrashZipFileEntry(entries, currentLogs + L"\\glfw_uwp.log", "logs/current/glfw_uwp.log");
     AddCrashZipFileEntry(entries, currentLogs + L"\\xboxone_gl_proxy.log", "logs/current/xboxone_gl_proxy.log");
     AddCrashZipFileEntry(entries, currentLogs + L"\\java_args.txt", "logs/current/java_args.txt");
+    AddCrashZipFileEntry(entries, currentLogs + L"\\java_classpath_final.txt", "logs/current/java_classpath_final.txt");
     AddCrashZipFileEntry(entries, reportGameDir + L"\\logs\\latest.log", "profile/game/logs/latest.log");
+    AddCrashZipFileEntry(entries, reportGameDir + L"\\logs\\debug.log", "profile/game/logs/debug.log");
     AddCrashZipFileEntry(entries, reportGameDir + L"\\logs\\fabric-loader.log", "profile/game/logs/fabric-loader.log");
+    AddCrashZipFileEntry(entries, reportGameDir + L"\\logs\\forge-loader.log", "profile/game/logs/forge-loader.log");
     AddCrashZipFileEntry(entries, reportGameDir + L"\\xbox_compat.log", "profile/game/xbox_compat.log");
     AddCrashZipMatchingFiles(entries, reportGameDir, L"hs_err_pid*.log", "profile/game");
+    AddCrashZipMatchingFiles(entries, reportGameDir + L"\\crash-reports", L"*.txt", "profile/game/crash-reports", 4);
     AddCrashZipMatchingFiles(entries, currentLogs, L"*.log", "logs/current");
     AddCrashZipMatchingFiles(entries, previousLogs, L"*.log", "logs_previous");
     AddCrashZipMatchingFiles(entries, reportsDir, L"*.txt", "crash-reports");
@@ -563,7 +588,7 @@ static void ArchivePreviousCrashIfNeeded(const std::wstring& runtimeRoot) {
 }
 
 static std::wstring RuntimeSeedStamp(const std::wstring& packageDir) {
-    return std::wstring(L"seedVersion=4\n") +
+    return std::wstring(L"seedVersion=5\n") +
         L"packageDir=" + packageDir + L"\n" +
         L"exe=" + FileStamp(packageDir + L"\\MC.Xbox.exe") + L"\n" +
         L"manifest=" + FileStamp(packageDir + L"\\AppxManifest.xml") + L"\n" +
@@ -578,6 +603,7 @@ static std::wstring RuntimeSeedStamp(const std::wstring& packageDir) {
         L"jvm21=" + FileStamp(packageDir + L"\\jre21\\bin\\server\\jvm.dll") + L"\n" +
         L"javaBasePatch21=" + FileStamp(packageDir + L"\\java-base-uwp-filesystem-21.jar") + L"\n" +
         L"zipfsPatch21=" + FileStamp(packageDir + L"\\java-zipfs-realpath-21.jar") + L"\n" +
+        L"secureJarHandlerPatch=" + FileStamp(packageDir + L"\\securejarhandler-uwp-patch.jar") + L"\n" +
         L"patchedFabricLoader=" + FileStamp(packageDir + L"\\runtime\\libraries\\net\\fabricmc\\fabric-loader\\" + a2w(kFabricLoaderVersion) + L"\\fabric-loader-" + a2w(kFabricLoaderVersion) + L".jar") + L"\n" +
         L"bundledMods=" + FileStamp(packageDir + L"\\runtime\\bundled-mods") + L"\n" +
         L"logConfig=" + FileStamp(packageDir + L"\\runtime\\log_configs\\client-uwp.xml") + L"\n" +
@@ -619,7 +645,11 @@ static bool IsLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std:
         GetFileAttributesW((localDir + L"\\java-base-uwp-filesystem-21.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool hasJavaZipfsPatch21 = !packageHasJre21 ||
         GetFileAttributesW((localDir + L"\\java-zipfs-realpath-21.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
-    return hasGameSupport && hasNatives && hasGraphics && hasJre && hasJavaBasePatch && hasJavaZipfsPatch && hasJre21 && hasJavaBasePatch21 && hasJavaZipfsPatch21;
+    const bool packageHasSecureJarHandlerPatch =
+        GetFileAttributesW((packageDir + L"\\securejarhandler-uwp-patch.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool hasSecureJarHandlerPatch = !packageHasSecureJarHandlerPatch ||
+        GetFileAttributesW((localDir + L"\\securejarhandler-uwp-patch.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
+    return hasGameSupport && hasNatives && hasGraphics && hasJre && hasJavaBasePatch && hasJavaZipfsPatch && hasJre21 && hasJavaBasePatch21 && hasJavaZipfsPatch21 && hasSecureJarHandlerPatch;
 }
 
 static void MarkLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std::wstring& localDir) {
@@ -649,6 +679,14 @@ static void CopyFileIfNeeded(const std::wstring& src, const std::wstring& dst) {
     CopyFileW(src.c_str(), dst.c_str(), FALSE);
 }
 
+static void CopyFileAlways(const std::wstring& src, const std::wstring& dst) {
+    if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+
+    EnsureDirectoryTree(GetParentDir(dst));
+    SetFileAttributesW(dst.c_str(), FILE_ATTRIBUTE_NORMAL);
+    CopyFileW(src.c_str(), dst.c_str(), FALSE);
+}
+
 static void CopyDirectoryContentsIfNeeded(const std::wstring& src, const std::wstring& dst) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((src + L"\\*").c_str(), &fd);
@@ -663,6 +701,26 @@ static void CopyDirectoryContentsIfNeeded(const std::wstring& src, const std::ws
             CopyDirectoryContentsIfNeeded(srcPath, dstPath);
         } else {
             CopyFileIfNeeded(srcPath, dstPath);
+        }
+    } while (FindNextFileW(h, &fd));
+
+    FindClose(h);
+}
+
+static void CopyDirectoryContentsAlways(const std::wstring& src, const std::wstring& dst) {
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((src + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    EnsureDirectoryTree(dst);
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        const std::wstring srcPath = src + L"\\" + fd.cFileName;
+        const std::wstring dstPath = dst + L"\\" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            CopyDirectoryContentsAlways(srcPath, dstPath);
+        } else {
+            CopyFileAlways(srcPath, dstPath);
         }
     } while (FindNextFileW(h, &fd));
 
@@ -717,6 +775,7 @@ static bool SeedLocalRuntime(
     CopyFileIfNeeded(packageDir + L"\\java-base-uwp-filesystem-21.jar", localDir + L"\\java-base-uwp-filesystem-21.jar");
     CopyFileIfNeeded(packageDir + L"\\java-zipfs-realpath.jar", localDir + L"\\java-zipfs-realpath.jar");
     CopyFileIfNeeded(packageDir + L"\\java-zipfs-realpath-21.jar", localDir + L"\\java-zipfs-realpath-21.jar");
+    CopyFileIfNeeded(packageDir + L"\\securejarhandler-uwp-patch.jar", localDir + L"\\securejarhandler-uwp-patch.jar");
     if (progress) {
         progress(L"Runtime ready", L"Starting Minecraft", 1.0f);
     }
@@ -1328,6 +1387,7 @@ static void CollectManifestLibraryJars(
         if (rel.rfind(L"game/libraries/", 0) != 0) continue;
         if (rel.size() < 4 || rel.compare(rel.size() - 4, 4, L".jar") != 0) continue;
         if (rel.find(L"-natives-") != std::wstring::npos) continue;
+        if (rel.find(L"-installer.jar") != std::wstring::npos) continue;
         const std::wstring libraryRelative = e.relativePath.substr(wcslen(L"game\\libraries\\"));
         const std::wstring packagedOverride = packageDir + L"\\runtime\\libraries\\" + libraryRelative;
         const std::wstring abs =
@@ -4410,6 +4470,14 @@ struct MinecraftVersionInfo {
     std::wstring javaRuntime;
     std::wstring assetIndex;
     std::wstring launchVersion;
+    std::wstring mainClass;
+    std::vector<std::wstring> extraJvmArgs;
+    std::vector<std::wstring> extraGameArgs;
+    std::wstring neoFormVersion;
+    std::wstring neoForgeInstallToolsVersion;
+    std::wstring neoForgeJarSplitterVersion;
+    std::wstring neoForgeBinaryPatcherVersion;
+    std::wstring neoForgeAutoRenamingToolVersion;
     std::wstring manifestPath;
     std::wstring loaderJar;
     std::wstring clientJar;
@@ -4417,7 +4485,31 @@ struct MinecraftVersionInfo {
     bool supported = false;
 };
 
-static void ReadManifestHeader(const std::wstring& manifestPath, std::wstring& assetIndex, std::wstring& launchVersion) {
+static std::vector<std::wstring> SplitManifestValueList(const std::wstring& value) {
+    std::vector<std::wstring> out;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t sep = value.find(L'\x1f', start);
+        std::wstring item = value.substr(start, sep == std::wstring::npos ? std::wstring::npos : sep - start);
+        if (!item.empty()) out.push_back(item);
+        if (sep == std::wstring::npos) break;
+        start = sep + 1;
+    }
+    return out;
+}
+
+static void ReadManifestHeader(
+    const std::wstring& manifestPath,
+    std::wstring& assetIndex,
+    std::wstring& launchVersion,
+    std::wstring& mainClass,
+    std::vector<std::wstring>& extraJvmArgs,
+    std::vector<std::wstring>& extraGameArgs,
+    std::wstring& neoFormVersion,
+    std::wstring& neoForgeInstallToolsVersion,
+    std::wstring& neoForgeJarSplitterVersion,
+    std::wstring& neoForgeBinaryPatcherVersion,
+    std::wstring& neoForgeAutoRenamingToolVersion) {
     std::ifstream f(manifestPath, std::ios::binary);
     if (!f) return;
     std::string line;
@@ -4431,6 +4523,14 @@ static void ReadManifestHeader(const std::wstring& manifestPath, std::wstring& a
         const std::string val = line.substr(tab + 1);
         if (key == "assetIndex") assetIndex = a2w(val.c_str());
         else if (key == "launchVersion") launchVersion = a2w(val.c_str());
+        else if (key == "mainClass") mainClass = a2w(val.c_str());
+        else if (key == "jvmArgs") extraJvmArgs = SplitManifestValueList(a2w(val.c_str()));
+        else if (key == "gameArgs") extraGameArgs = SplitManifestValueList(a2w(val.c_str()));
+        else if (key == "neoFormVersion") neoFormVersion = a2w(val.c_str());
+        else if (key == "neoForgeInstallToolsVersion") neoForgeInstallToolsVersion = a2w(val.c_str());
+        else if (key == "neoForgeJarSplitterVersion") neoForgeJarSplitterVersion = a2w(val.c_str());
+        else if (key == "neoForgeBinaryPatcherVersion") neoForgeBinaryPatcherVersion = a2w(val.c_str());
+        else if (key == "neoForgeAutoRenamingToolVersion") neoForgeAutoRenamingToolVersion = a2w(val.c_str());
     }
 }
 
@@ -4458,10 +4558,17 @@ static MinecraftVersionInfo ResolveVersionInfo(const std::wstring& packageDir, c
     }
 
     if (!info.manifestPath.empty()) {
-        ReadManifestHeader(info.manifestPath, info.assetIndex, info.launchVersion);
+        ReadManifestHeader(info.manifestPath, info.assetIndex, info.launchVersion, info.mainClass, info.extraJvmArgs, info.extraGameArgs,
+            info.neoFormVersion, info.neoForgeInstallToolsVersion, info.neoForgeJarSplitterVersion,
+            info.neoForgeBinaryPatcherVersion, info.neoForgeAutoRenamingToolVersion);
     }
     if (info.assetIndex.empty() && isDefault) info.assetIndex = a2w(kMinecraftAssetIndex);
     if (info.launchVersion.empty() && isDefault) info.launchVersion = a2w(kFabricLaunchVersion);
+    if (info.mainClass.empty() && isFabric) info.mainClass = L"net.fabricmc.loader.impl.launch.knot.KnotClient";
+    if (isFabric) {
+        info.extraJvmArgs.clear();
+        info.extraGameArgs.clear();
+    }
 
     if (GetFileAttributesW(packagedLoaderJar.c_str()) != INVALID_FILE_ATTRIBUTES) {
         info.loaderJar = packagedLoaderJar;
@@ -4474,9 +4581,15 @@ static MinecraftVersionInfo ResolveVersionInfo(const std::wstring& packageDir, c
         info.bundledModsDir = packageDir + L"\\runtime\\bundled-mods";
     }
 
-    info.supported = isFabric && !info.manifestPath.empty() &&
-        !info.assetIndex.empty() && !info.launchVersion.empty() &&
-        !info.loaderJar.empty() && !info.bundledModsDir.empty();
+    if (isFabric) {
+        info.supported = !info.manifestPath.empty() &&
+            !info.assetIndex.empty() && !info.launchVersion.empty() &&
+            !info.mainClass.empty() && !info.loaderJar.empty() && !info.bundledModsDir.empty();
+    } else {
+        info.supported = !info.manifestPath.empty() &&
+            !info.assetIndex.empty() && !info.launchVersion.empty() &&
+            !info.mainClass.empty();
+    }
     return info;
 }
 
@@ -8961,6 +9074,585 @@ static bool CheckAndClearReturnToLauncherSignal(JNIEnv* env, const wchar_t* stag
     return false;
 }
 
+static bool InvokeJavaMain(JNIEnv* env, const std::wstring& className, const std::vector<std::string>& args) {
+    std::wstring classPath = className;
+    std::replace(classPath.begin(), classPath.end(), L'.', L'/');
+
+    jclass mainClass = env->FindClass(w2a(classPath).c_str());
+    if (!mainClass || CheckAndLogJavaException(env, (L"FindClass(" + className + L")").c_str())) {
+        return false;
+    }
+
+    jmethodID mainMethod = env->GetStaticMethodID(mainClass, "main", "([Ljava/lang/String;)V");
+    if (!mainMethod || CheckAndLogJavaException(env, (L"GetStaticMethodID(" + className + L".main)").c_str())) {
+        env->DeleteLocalRef(mainClass);
+        return false;
+    }
+
+    jclass stringClass = env->FindClass("java/lang/String");
+    if (!stringClass || CheckAndLogJavaException(env, L"FindClass(String)")) {
+        env->DeleteLocalRef(mainClass);
+        return false;
+    }
+
+    jobjectArray argv = env->NewObjectArray(static_cast<jsize>(args.size()), stringClass, nullptr);
+    if (!argv || CheckAndLogJavaException(env, (L"NewObjectArray(" + className + L")").c_str())) {
+        env->DeleteLocalRef(stringClass);
+        env->DeleteLocalRef(mainClass);
+        return false;
+    }
+
+    for (jsize i = 0; i < static_cast<jsize>(args.size()); ++i) {
+        jstring value = env->NewStringUTF(args[i].c_str());
+        if (!value || CheckAndLogJavaException(env, (L"NewStringUTF(" + className + L")").c_str())) {
+            env->DeleteLocalRef(argv);
+            env->DeleteLocalRef(stringClass);
+            env->DeleteLocalRef(mainClass);
+            return false;
+        }
+        env->SetObjectArrayElement(argv, i, value);
+        env->DeleteLocalRef(value);
+        if (CheckAndLogJavaException(env, (L"SetObjectArrayElement(" + className + L")").c_str())) {
+            env->DeleteLocalRef(argv);
+            env->DeleteLocalRef(stringClass);
+            env->DeleteLocalRef(mainClass);
+            return false;
+        }
+    }
+
+    WriteLogF(L"Invoking NeoForge prep tool %s", className.c_str());
+    env->CallStaticVoidMethod(mainClass, mainMethod, argv);
+    const bool failed = CheckAndLogJavaException(env, (L"CallStaticVoidMethod(" + className + L".main)").c_str());
+    env->DeleteLocalRef(argv);
+    env->DeleteLocalRef(stringClass);
+    env->DeleteLocalRef(mainClass);
+    return !failed;
+}
+
+static bool ExtractZipEntryToFile(const std::wstring& zipPath, const char* entryName, const std::wstring& outputPath) {
+    std::vector<unsigned char> zipBytes;
+    if (!ReadBinaryFileLimited(zipPath, zipBytes, 256ull * 1024ull * 1024ull)) {
+        WriteLogF(L"Could not read zip for extraction: %s", zipPath.c_str());
+        return false;
+    }
+
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_mem(&zip, zipBytes.data(), zipBytes.size(), 0)) {
+        WriteLogF(L"Could not open zip for extraction: %s", zipPath.c_str());
+        return false;
+    }
+
+    const int idx = mz_zip_reader_locate_file(&zip, entryName, nullptr, 0);
+    if (idx < 0) {
+        mz_zip_reader_end(&zip);
+        WriteLogF(L"Zip entry not found: %s in %s", a2w(entryName).c_str(), zipPath.c_str());
+        return false;
+    }
+
+    size_t outSize = 0;
+    void* p = mz_zip_reader_extract_to_heap(&zip, static_cast<mz_uint>(idx), &outSize, 0);
+    mz_zip_reader_end(&zip);
+    if (!p) {
+        WriteLogF(L"Could not extract zip entry: %s", a2w(entryName).c_str());
+        return false;
+    }
+
+    const bool ok = WriteAllBytes(outputPath, p, outSize);
+    mz_free(p);
+    if (!ok) {
+        WriteLogF(L"Could not write extracted zip entry: %s", outputPath.c_str());
+    }
+    return ok;
+}
+
+static bool FileExistsNonEmpty(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA data = {};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return false;
+    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return false;
+    return data.nFileSizeHigh != 0 || data.nFileSizeLow != 0;
+}
+
+// a truncated jar from an interrupted prep is still non-empty, so the caller validates it by
+// confirming the zip parses and carries a class that must exist in a complete client.
+static bool ZipHasEntry(const std::wstring& zipPath, const char* entryName) {
+    std::vector<unsigned char> zipBytes;
+    if (!ReadBinaryFileLimited(zipPath, zipBytes, 256ull * 1024ull * 1024ull)) return false;
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_mem(&zip, zipBytes.data(), zipBytes.size(), 0)) return false;
+    const int idx = mz_zip_reader_locate_file(&zip, entryName, nullptr, 0);
+    mz_zip_reader_end(&zip);
+    return idx >= 0;
+}
+
+// the binary-patched client only carries the classes NeoForge actually patches, so it can't be
+// checked for a specific vanilla class. a truncated jar fails central-directory parsing here.
+static bool ZipIsValid(const std::wstring& zipPath) {
+    std::vector<unsigned char> zipBytes;
+    if (!ReadBinaryFileLimited(zipPath, zipBytes, 256ull * 1024ull * 1024ull)) return false;
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_mem(&zip, zipBytes.data(), zipBytes.size(), 0)) return false;
+    const mz_uint count = mz_zip_reader_get_num_files(&zip);
+    mz_zip_reader_end(&zip);
+    return count > 0;
+}
+
+static bool EndsWithAscii(const char* text, const char* suffix) {
+    const size_t textLen = strlen(text);
+    const size_t suffixLen = strlen(suffix);
+    return textLen >= suffixLen && strcmp(text + textLen - suffixLen, suffix) == 0;
+}
+
+static bool NeoForgeSrgJarComplete(const std::wstring& zipPath) {
+    if (!FileExistsNonEmpty(zipPath)) return false;
+
+    std::vector<unsigned char> zipBytes;
+    if (!ReadBinaryFileLimited(zipPath, zipBytes, 256ull * 1024ull * 1024ull)) return false;
+
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_mem(&zip, zipBytes.data(), zipBytes.size(), 0)) return false;
+
+    const char* requiredEntries[] = {
+        "net/minecraft/client/main/Main.class",
+        "net/minecraft/core/Registry.class",
+        "net/minecraft/core/RegistryAccess.class",
+        "net/minecraft/core/Holder.class",
+        "net/minecraft/core/registries/BuiltInRegistries.class",
+        "net/minecraft/server/Bootstrap.class",
+    };
+
+    bool ok = true;
+    for (const char* entry : requiredEntries) {
+        if (mz_zip_reader_locate_file(&zip, entry, nullptr, 0) < 0) {
+            WriteLogF(L"NeoForge SRG client missing required entry: %s", a2w(entry).c_str());
+            ok = false;
+            break;
+        }
+    }
+
+    mz_uint classCount = 0;
+    if (ok) {
+        const mz_uint fileCount = mz_zip_reader_get_num_files(&zip);
+        for (mz_uint i = 0; i < fileCount; ++i) {
+            mz_zip_archive_file_stat stat{};
+            if (mz_zip_reader_file_stat(&zip, i, &stat) && EndsWithAscii(stat.m_filename, ".class")) {
+                ++classCount;
+            }
+        }
+        if (classCount < 8000) {
+            WriteLogF(L"NeoForge SRG client has too few classes: %u", static_cast<unsigned>(classCount));
+            ok = false;
+        }
+    }
+
+    mz_zip_reader_end(&zip);
+    return ok;
+}
+
+static std::wstring NeoForgeSrgJarSummary(const std::wstring& zipPath) {
+    std::vector<unsigned char> zipBytes;
+    if (!ReadBinaryFileLimited(zipPath, zipBytes, 256ull * 1024ull * 1024ull)) {
+        return L"unreadable stamp=" + FileStamp(zipPath);
+    }
+
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_mem(&zip, zipBytes.data(), zipBytes.size(), 0)) {
+        return L"invalid-zip stamp=" + FileStamp(zipPath);
+    }
+
+    const char* requiredEntries[] = {
+        "net/minecraft/client/main/Main.class",
+        "net/minecraft/core/Registry.class",
+        "net/minecraft/core/RegistryAccess.class",
+        "net/minecraft/core/Holder.class",
+        "net/minecraft/core/registries/BuiltInRegistries.class",
+        "net/minecraft/server/Bootstrap.class",
+    };
+
+    mz_uint classCount = 0;
+    const mz_uint fileCount = mz_zip_reader_get_num_files(&zip);
+    for (mz_uint i = 0; i < fileCount; ++i) {
+        mz_zip_archive_file_stat stat{};
+        if (mz_zip_reader_file_stat(&zip, i, &stat) && EndsWithAscii(stat.m_filename, ".class")) {
+            ++classCount;
+        }
+    }
+
+    std::wstring missing;
+    for (const char* entry : requiredEntries) {
+        if (mz_zip_reader_locate_file(&zip, entry, nullptr, 0) < 0) {
+            if (!missing.empty()) missing += L",";
+            missing += a2w(entry);
+        }
+    }
+
+    mz_zip_reader_end(&zip);
+    std::wstringstream ss;
+    ss << L"stamp=" << FileStamp(zipPath)
+       << L" classes=" << static_cast<unsigned>(classCount)
+       << L" missing=" << (missing.empty() ? L"(none)" : missing);
+    return ss.str();
+}
+
+static std::wstring FirstArgValue(const std::vector<std::wstring>& args, const std::wstring& name) {
+    for (size_t i = 0; i + 1 < args.size(); ++i) {
+        if (args[i] == name) return args[i + 1];
+    }
+    return {};
+}
+
+static std::wstring NeoForgeVersionFromLaunchVersion(const std::wstring& launchVersion) {
+    const std::wstring prefix = L"neoforge-";
+    if (launchVersion.rfind(prefix, 0) == 0) {
+        return launchVersion.substr(prefix.size());
+    }
+    return launchVersion;
+}
+
+static std::wstring MavenPath(
+    const std::wstring& group,
+    const std::wstring& artifact,
+    const std::wstring& version,
+    const std::wstring& classifier = L"",
+    const std::wstring& extension = L"jar") {
+    std::wstring groupPath = group;
+    std::replace(groupPath.begin(), groupPath.end(), L'.', L'\\');
+    return groupPath + L"\\" + artifact + L"\\" + version + L"\\" +
+        artifact + L"-" + version + (classifier.empty() ? L"" : (L"-" + classifier)) + L"." + extension;
+}
+
+static bool NeoForgeClientArtifactsReady(
+    const std::wstring& runtimeRoot,
+    const std::wstring& minecraftVersion,
+    const std::wstring& launchVersion,
+    const std::vector<std::wstring>& extraGameArgs,
+    const std::wstring& manifestNeoFormVersion) {
+    const std::wstring neoForgeVersion = NeoForgeVersionFromLaunchVersion(launchVersion);
+    const std::wstring neoFormVersion = !manifestNeoFormVersion.empty()
+        ? manifestNeoFormVersion
+        : FirstArgValue(extraGameArgs, L"--fml.neoFormVersion");
+    if (neoForgeVersion.empty() || neoFormVersion.empty()) {
+        WriteLogF(L"NeoForge artifact readiness check missing metadata neoforge=%s neoform=%s",
+            neoForgeVersion.c_str(), neoFormVersion.c_str());
+        return false;
+    }
+
+    const std::wstring libraryDir = runtimeRoot + L"\\game\\libraries";
+    const std::wstring mcAndNeoForm = minecraftVersion + L"-" + neoFormVersion;
+    const std::wstring mcExtra = libraryDir + L"\\" + MavenPath(L"net.minecraft", L"client", mcAndNeoForm, L"extra");
+    const std::wstring mcSrg = libraryDir + L"\\" + MavenPath(L"net.minecraft", L"client", mcAndNeoForm, L"srg");
+    const std::wstring patchedClient = libraryDir + L"\\" + MavenPath(L"net.neoforged", L"neoforge", neoForgeVersion, L"client");
+    return NeoForgeSrgJarComplete(mcSrg) &&
+        FileExistsNonEmpty(mcExtra) &&
+        FileExistsNonEmpty(patchedClient) &&
+        ZipIsValid(patchedClient);
+}
+
+static bool PrepareNeoForgeClientArtifacts(
+    JNIEnv* env,
+    const std::wstring& runtimeRoot,
+    const std::wstring& clientJar,
+    const std::wstring& minecraftVersion,
+    const std::wstring& launchVersion,
+    const std::vector<std::wstring>& extraGameArgs,
+    const std::wstring& manifestNeoFormVersion,
+    const std::wstring& installToolsVersion,
+    const std::wstring& jarSplitterVersion,
+    const std::wstring& binaryPatcherVersion,
+    const std::wstring& autoRenamingToolVersion) {
+    const std::wstring neoForgeVersion = NeoForgeVersionFromLaunchVersion(launchVersion);
+    const std::wstring neoFormVersion = !manifestNeoFormVersion.empty()
+        ? manifestNeoFormVersion
+        : FirstArgValue(extraGameArgs, L"--fml.neoFormVersion");
+    if (neoForgeVersion.empty() || neoFormVersion.empty()) {
+        WriteLogF(L"NeoForge prep missing version metadata neoforge=%s neoform=%s",
+            neoForgeVersion.c_str(), neoFormVersion.c_str());
+        return false;
+    }
+
+    const std::wstring toolsVersion = installToolsVersion.empty() ? L"2.1.2" : installToolsVersion;
+    const std::wstring splitterVersion = jarSplitterVersion.empty() ? toolsVersion : jarSplitterVersion;
+    const std::wstring patcherVersion = binaryPatcherVersion.empty() ? toolsVersion : binaryPatcherVersion;
+    const std::wstring artVersion = autoRenamingToolVersion.empty() ? L"2.0.3" : autoRenamingToolVersion;
+    const std::wstring libraryDir = runtimeRoot + L"\\game\\libraries";
+    const std::wstring mcAndNeoForm = minecraftVersion + L"-" + neoFormVersion;
+
+    const std::wstring mcSlim = libraryDir + L"\\" + MavenPath(L"net.minecraft", L"client", mcAndNeoForm, L"slim");
+    const std::wstring mcExtra = libraryDir + L"\\" + MavenPath(L"net.minecraft", L"client", mcAndNeoForm, L"extra");
+    const std::wstring mcSrg = libraryDir + L"\\" + MavenPath(L"net.minecraft", L"client", mcAndNeoForm, L"srg");
+    const std::wstring patchedClient = libraryDir + L"\\" + MavenPath(L"net.neoforged", L"neoforge", neoForgeVersion, L"client");
+    const std::wstring neoformZip = libraryDir + L"\\" + MavenPath(L"net.neoforged", L"neoform", mcAndNeoForm, L"", L"zip");
+    const std::wstring mappings = libraryDir + L"\\" + MavenPath(L"net.neoforged", L"neoform", mcAndNeoForm, L"mappings", L"txt");
+    const std::wstring mojmaps = libraryDir + L"\\" + MavenPath(L"net.minecraft", L"client", mcAndNeoForm, L"mappings", L"txt");
+    const std::wstring mergedMappings = libraryDir + L"\\" + MavenPath(L"net.neoforged", L"neoform", mcAndNeoForm, L"mappings-merged", L"txt");
+    const std::wstring installerJar = libraryDir + L"\\" + MavenPath(L"net.neoforged", L"neoforge", neoForgeVersion, L"installer");
+    const std::wstring binPatch = runtimeRoot + L"\\game\\neoforge\\" + neoForgeVersion + L"\\client.lzma";
+
+    auto clientJarComplete = [&](const std::wstring& jar) {
+        return NeoForgeSrgJarComplete(jar);
+    };
+    auto patchedJarValid = [&](const std::wstring& jar) {
+        return FileExistsNonEmpty(jar) && ZipIsValid(jar);
+    };
+
+    if (clientJarComplete(mcSrg) && FileExistsNonEmpty(mcExtra) && patchedJarValid(patchedClient)) {
+        WriteLogF(L"NeoForge client artifacts already prepared for %s", mcAndNeoForm.c_str());
+        return true;
+    }
+    if (FileExistsNonEmpty(patchedClient) && !patchedJarValid(patchedClient)) {
+        WriteLogF(L"NeoForge patched client incomplete, regenerating: %s", patchedClient.c_str());
+    }
+
+    WriteLogF(L"Preparing NeoForge client artifacts neoforge=%s minecraft=%s neoform=%s",
+        neoForgeVersion.c_str(), minecraftVersion.c_str(), neoFormVersion.c_str());
+    WriteLogF(L"Expected NeoForge artifacts: srg=%s extra=%s patched=%s",
+        mcSrg.c_str(), mcExtra.c_str(), patchedClient.c_str());
+
+    if (!FileExistsNonEmpty(binPatch)) {
+        if (!FileExistsNonEmpty(installerJar)) {
+            WriteLogF(L"NeoForge installer jar missing: %s", installerJar.c_str());
+            return false;
+        }
+        if (!ExtractZipEntryToFile(installerJar, "data/client.lzma", binPatch)) {
+            return false;
+        }
+    }
+
+    const std::wstring simpleMojmaps = libraryDir + L"\\" + MavenPath(L"net.minecraft", L"client", minecraftVersion, L"mappings", L"txt");
+    if (!FileExistsNonEmpty(mojmaps) && FileExistsNonEmpty(simpleMojmaps)) {
+        EnsureDirectoryTree(GetParentDir(mojmaps));
+        CopyFileW(simpleMojmaps.c_str(), mojmaps.c_str(), FALSE);
+    }
+
+    auto runInstallTools = [&](std::vector<std::string> args) {
+        return InvokeJavaMain(env, L"net.neoforged.installertools.ConsoleTool", args);
+    };
+    auto runSplitter = [&](std::vector<std::string> args) {
+        return InvokeJavaMain(env, L"net.neoforged.jarsplitter.ConsoleTool", args);
+    };
+    auto runArt = [&](std::vector<std::string> args) {
+        return InvokeJavaMain(env, L"net.neoforged.art.Main", args);
+    };
+    auto runPatcher = [&](std::vector<std::string> args) {
+        return InvokeJavaMain(env, L"net.neoforged.binarypatcher.ConsoleTool", args);
+    };
+
+    EnsureDirectoryTree(GetParentDir(mcSlim));
+    EnsureDirectoryTree(GetParentDir(mcExtra));
+    EnsureDirectoryTree(GetParentDir(mcSrg));
+    EnsureDirectoryTree(GetParentDir(patchedClient));
+    EnsureDirectoryTree(GetParentDir(mappings));
+    EnsureDirectoryTree(GetParentDir(mojmaps));
+    EnsureDirectoryTree(GetParentDir(mergedMappings));
+
+    if (!FileExistsNonEmpty(mappings) &&
+        !runInstallTools({ "--task", "MCP_DATA", "--input", w2a(fwd(neoformZip)), "--output", w2a(fwd(mappings)), "--key", "mappings" })) return false;
+    if (!FileExistsNonEmpty(mojmaps) &&
+        !runInstallTools({ "--task", "DOWNLOAD_MOJMAPS", "--version", w2a(minecraftVersion), "--side", "client", "--output", w2a(fwd(mojmaps)) })) return false;
+    if (!FileExistsNonEmpty(mergedMappings) &&
+        !runInstallTools({ "--task", "MERGE_MAPPING", "--left", w2a(fwd(mappings)), "--right", w2a(fwd(mojmaps)), "--output", w2a(fwd(mergedMappings)), "--classes", "--fields", "--methods", "--reverse-right" })) return false;
+    if (!runSplitter({ "--input", w2a(fwd(clientJar)), "--slim", w2a(fwd(mcSlim)), "--extra", w2a(fwd(mcExtra)), "--srg", w2a(fwd(mergedMappings)) })) return false;
+
+    if (!clientJarComplete(mcSrg)) {
+        const std::wstring tmp = mcSrg + L".tmp";
+        DeleteFileW(tmp.c_str());
+        if (!runArt({ "--input", w2a(fwd(mcSlim)), "--output", w2a(fwd(tmp)), "--names", w2a(fwd(mergedMappings)), "--ann-fix", "--ids-fix", "--src-fix", "--record-fix" })) {
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
+        if (!clientJarComplete(tmp)) {
+            WriteLogF(L"NeoForge SRG client incomplete after rename tool: %s", mcSrg.c_str());
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
+        DeleteFileW(mcSrg.c_str());
+        if (!MoveFileExW(tmp.c_str(), mcSrg.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            WriteLogF(L"NeoForge SRG client rename failed err=%u: %s", GetLastError(), mcSrg.c_str());
+            return false;
+        }
+    }
+
+    if (!patchedJarValid(patchedClient)) {
+        const std::wstring tmp = patchedClient + L".tmp";
+        DeleteFileW(tmp.c_str());
+        if (!runPatcher({ "--clean", w2a(fwd(mcSrg)), "--output", w2a(fwd(tmp)), "--apply", w2a(fwd(binPatch)) })) {
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
+        if (!patchedJarValid(tmp)) {
+            WriteLogF(L"NeoForge patched client incomplete after binary patch: %s", patchedClient.c_str());
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
+        DeleteFileW(patchedClient.c_str());
+        if (!MoveFileExW(tmp.c_str(), patchedClient.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            WriteLogF(L"NeoForge patched client rename failed err=%u: %s", GetLastError(), patchedClient.c_str());
+            return false;
+        }
+    }
+
+    const bool ready = clientJarComplete(mcSrg) && FileExistsNonEmpty(mcExtra) && patchedJarValid(patchedClient);
+    WriteLogF(L"NeoForge client prep ready=%d srg=%s extra=%s patched=%s",
+        ready ? 1 : 0,
+        FileStamp(mcSrg).c_str(),
+        FileStamp(mcExtra).c_str(),
+        FileStamp(patchedClient).c_str());
+    return ready;
+}
+
+static void EnsureNeoForgeFmlConfig(const std::wstring& gameDir) {
+    const std::wstring configDir = gameDir + L"\\config";
+    EnsureDirectoryTree(configDir);
+
+    const std::wstring configPath = configDir + L"\\fml.toml";
+    std::wstring body;
+    ReadTextFile(configPath, body);
+
+    std::wstringstream in(body);
+    std::wstring line;
+    std::wstring out;
+    bool foundEarlyWindowControl = false;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        const std::wstring trimmed = TrimWhitespace(line);
+        if (trimmed.rfind(L"earlyWindowControl", 0) == 0) {
+            out += L"earlyWindowControl = false\n";
+            foundEarlyWindowControl = true;
+        } else {
+            out += line + L"\n";
+        }
+    }
+
+    if (!foundEarlyWindowControl) {
+        if (!out.empty() && out.back() != L'\n') out += L"\n";
+        out += L"earlyWindowControl = false\n";
+    }
+
+    if (WriteTextFile(configPath, out)) {
+        WriteLogF(L"NeoForge FML early window disabled in %s", configPath.c_str());
+    } else {
+        WriteLogF(L"Failed to write NeoForge FML config %s err=%u", configPath.c_str(), GetLastError());
+    }
+}
+
+// asm + bootstraplauncher/securejarhandler/JarJar live on --module-path, and the neoform/installer
+// tools (+ their asm 9.3) are only needed for the in-process prep pass. none of them may sit on the
+// game class-path or BootstrapLauncher.run() aborts with "module X already on the JVMs module path".
+static bool IsNeoForgePrepOrModuleJar(const std::wstring& entry) {
+    std::wstring p = entry;
+    std::replace(p.begin(), p.end(), L'\\', L'/');
+    std::transform(p.begin(), p.end(), p.begin(), [](wchar_t c) { return (wchar_t)towlower(c); });
+    static const wchar_t* kExcluded[] = {
+        L"/org/ow2/asm/",
+        L"/cpw/mods/bootstraplauncher/",
+        L"/cpw/mods/securejarhandler/",
+        L"/net/neoforged/jarjarfilesystems/",
+        L"/net/md-5/specialsource/",
+        L"/net/minecraftforge/srgutils/",
+        L"/net/neoforged/srgutils/",
+        L"/net/neoforged/autorenamingtool/",
+        L"/net/neoforged/installertools/",
+        L"-installer.jar",
+        // raw vanilla client (game/versions/<mc>/<mc>.jar) is only a prep input. NeoForge supplies
+        // the patched srg client as the `minecraft` module via its production client provider, so the
+        // vanilla jar on the class-path becomes a second module owning net.minecraft.* and the module
+        // layer fails to resolve.
+        L"/versions/",
+    };
+    for (const wchar_t* needle : kExcluded) {
+        if (p.find(needle) != std::wstring::npos) return true;
+    }
+    // NeoForge's launch handler locates the universal jar explicitly through a PathBasedLocator.
+    // If it is also on java.class.path, FML marks it as already located and skips loading
+    // META-INF/neoforge.mods.toml, which leaves the neoforge mod container missing.
+    if (p.find(L"/net/neoforged/neoforge/") != std::wstring::npos &&
+        p.find(L"-universal.jar") != std::wstring::npos) {
+        return true;
+    }
+    return false;
+}
+
+static std::wstring BuildNeoForgeGameClassPath(
+    const std::wstring& fullClassPath,
+    size_t* keptOut,
+    size_t* droppedOut) {
+    std::vector<std::wstring> survivors;
+    size_t dropped = 0;
+    std::wstringstream in(fullClassPath);
+    std::wstring entry;
+    while (std::getline(in, entry, L';')) {
+        if (entry.empty()) continue;
+        if (IsNeoForgePrepOrModuleJar(entry)) {
+            dropped++;
+            continue;
+        }
+        survivors.push_back(entry);
+    }
+
+    // stale prep-time deps (guava 20.0, gson 2.8.9, commons-lang3 3.8.1, ...) ship the same maven
+    // artifact at a lower version than the neoforge runtime one. under the secure-jar module loader
+    // the older copy shadows the newer and trips NoClassDefFoundError, so keep only the highest
+    // version of each group/artifact.
+    std::vector<std::wstring> keys;
+    std::map<std::wstring, std::wstring> chosenEntry;
+    std::map<std::wstring, std::wstring> chosenVer;
+    for (const std::wstring& e : survivors) {
+        std::wstring norm = e;
+        std::replace(norm.begin(), norm.end(), L'\\', L'/');
+        std::wstring key = e, ver;
+        const size_t fileSlash = norm.find_last_of(L'/');
+        if (fileSlash != std::wstring::npos) {
+            const std::wstring dir = norm.substr(0, fileSlash);
+            const size_t verSlash = dir.find_last_of(L'/');
+            if (verSlash != std::wstring::npos) {
+                ver = dir.substr(verSlash + 1);
+                key = dir.substr(0, verSlash);
+            }
+        }
+        auto it = chosenEntry.find(key);
+        if (it == chosenEntry.end()) {
+            keys.push_back(key);
+            chosenEntry[key] = e;
+            chosenVer[key] = ver;
+        } else {
+            dropped++;
+            if (CompareVersionNumbers(w2a(ver), w2a(chosenVer[key])) > 0) {
+                chosenEntry[key] = e;
+                chosenVer[key] = ver;
+            }
+        }
+    }
+
+    std::wstring out;
+    size_t kept = 0;
+    for (const std::wstring& k : keys) {
+        if (!out.empty()) out += L";";
+        out += chosenEntry[k];
+        kept++;
+    }
+    if (keptOut) *keptOut = kept;
+    if (droppedOut) *droppedOut = dropped;
+    return out;
+}
+
+static void SetJavaSystemProperty(JNIEnv* env, const std::wstring& key, const std::wstring& value) {
+    jclass sys = env->FindClass("java/lang/System");
+    if (!sys || CheckAndLogJavaException(env, L"FindClass(System)")) return;
+    jmethodID setProp = env->GetStaticMethodID(sys, "setProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+    if (!setProp || CheckAndLogJavaException(env, L"GetStaticMethodID(System.setProperty)")) {
+        env->DeleteLocalRef(sys);
+        return;
+    }
+    jstring k = env->NewStringUTF(w2a(key).c_str());
+    jstring v = env->NewStringUTF(w2a(value).c_str());
+    jobject prev = env->CallStaticObjectMethod(sys, setProp, k, v);
+    CheckAndLogJavaException(env, L"System.setProperty");
+    if (prev) env->DeleteLocalRef(prev);
+    env->DeleteLocalRef(k);
+    env->DeleteLocalRef(v);
+    env->DeleteLocalRef(sys);
+}
+
 static void DumpJavaThreadStacks(JavaVM* vm, const wchar_t* reason) {
     if (!vm) return;
 
@@ -9098,10 +9790,58 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::wstring& launchVersion,
     const std::wstring& assetIndex,
     const std::wstring& minecraftVersion,
+    const std::wstring& loader,
+    const std::wstring& loaderVersion,
+    const std::wstring& mainClassName,
+    const std::vector<std::wstring>& extraJvmArgs,
+    const std::vector<std::wstring>& extraGameArgs,
+    const std::wstring& neoFormVersion,
+    const std::wstring& neoForgeInstallToolsVersion,
+    const std::wstring& neoForgeJarSplitterVersion,
+    const std::wstring& neoForgeBinaryPatcherVersion,
+    const std::wstring& neoForgeAutoRenamingToolVersion,
     const LaunchAuthConfig& authConfig)
 {
-    const std::wstring jnaTmpDir = nativesDir;
+    const bool isFabric = _wcsicmp(loader.c_str(), L"fabric") == 0;
+    const bool isNeoForge = _wcsicmp(loader.c_str(), L"neoforge") == 0;
+    const std::wstring effectiveMainClass = mainClassName.empty()
+        ? L"net.fabricmc.loader.impl.launch.knot.KnotClient"
+        : mainClassName;
+    std::wstring mainClassPath = effectiveMainClass;
+    std::replace(mainClassPath.begin(), mainClassPath.end(), L'.', L'/');
+    const std::wstring libraryDir = exeDir + L"\\game\\libraries";
+    const std::wstring neoForgeVersionForLaunch = NeoForgeVersionFromLaunchVersion(launchVersion);
+    const std::wstring neoFormVersionForLaunch = !neoFormVersion.empty()
+        ? neoFormVersion
+        : FirstArgValue(extraGameArgs, L"--fml.neoFormVersion");
+    const std::wstring neoForgeUniversalJar =
+        isNeoForge && !neoForgeVersionForLaunch.empty()
+            ? libraryDir + L"\\" + MavenPath(L"net.neoforged", L"neoforge", neoForgeVersionForLaunch, L"universal")
+            : L"";
+    std::wstring neoForgeMinecraftSrgJar;
+    if (!minecraftVersion.empty() && !neoFormVersionForLaunch.empty()) {
+        const std::wstring mcAndNeoForm = minecraftVersion + L"-" + neoFormVersionForLaunch;
+        neoForgeMinecraftSrgJar = libraryDir + L"\\" + MavenPath(L"net.minecraft", L"client", mcAndNeoForm, L"srg");
+    }
+    auto expandLaunchArg = [&](std::wstring arg) {
+        auto replaceAll = [&](const std::wstring& from, const std::wstring& to) {
+            size_t pos = 0;
+            while ((pos = arg.find(from, pos)) != std::wstring::npos) {
+                arg.replace(pos, from.size(), to);
+                pos += to.size();
+            }
+        };
+        replaceAll(L"${library_directory}", fwd(libraryDir));
+        replaceAll(L"${classpath_separator}", L";");
+        replaceAll(L"${version_name}", launchVersion);
+        replaceAll(L"${natives_directory}", fwd(nativesDir));
+        replaceAll(L"${launcher_name}", L"BanditLauncher");
+        replaceAll(L"${launcher_version}", L"1");
+        return arg;
+    };
+    const std::wstring jnaTmpDir = gameDir + L"\\tmp";
     const std::wstring lwjglTmpDir = exeDir + L"\\tmp";
+    const std::wstring launcherOverrideDir = gameDir + L"\\launcher-overrides";
     const std::wstring packagedNativesDir = packageDir + L"\\natives";
     const bool suppliedNativesReady =
         GetFileAttributesW((nativesDir + L"\\lwjgl.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
@@ -9115,6 +9855,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::wstring lwjglGlfwDll = lwjglNativeDir + L"\\glfw.dll";
     const std::wstring logConfigPath = exeDir + L"\\game\\log_configs\\client-uwp.xml";
     const std::wstring fabricLogPath = gameDir + L"\\logs\\fabric-loader.log";
+    const std::wstring forgeLogPath = gameDir + L"\\logs\\forge-loader.log";
     const std::wstring latestLogPath = gameDir + L"\\logs\\latest.log";
     const std::wstring xboxCompatLogPath = gameDir + L"\\xbox_compat.log";
     const std::wstring launcherLogDir = LogsCurrentDir(exeDir);
@@ -9127,6 +9868,8 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     EnsureDirectoryTree(gameDir + L"\\resourcepacks");
     EnsureDirectoryTree(gameDir + L"\\screenshots");
     EnsureDirectoryTree(gameDir + L"\\config");
+    EnsureDirectoryTree(jnaTmpDir);
+    EnsureDirectoryTree(launcherOverrideDir);
     DeleteDirectoryTree(gameDir + L"\\showdown");
     DeleteDirectoryTree(exeDir + L"\\showdown");
     EnsureDirectoryTree(gameDir + L"\\showdown");
@@ -9146,6 +9889,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     DeleteFileW(javaLog.c_str());
     DeleteFileW(stderrLogPath.c_str());
     DeleteFileW(fabricLogPath.c_str());
+    DeleteFileW(forgeLogPath.c_str());
     DeleteFileW(latestLogPath.c_str());
     DeleteFileW(xboxCompatLogPath.c_str());
 
@@ -9158,7 +9902,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::vector<LogTailerConfig> tailerConfigs = {
         LogTailerConfig{ javaLog, L"java_output.log" },
         LogTailerConfig{ stderrLogPath, L"stderr_stream.log" },
-        LogTailerConfig{ fabricLogPath, L"fabric-loader.log" },
+        LogTailerConfig{ isFabric ? fabricLogPath : forgeLogPath, isFabric ? L"fabric-loader.log" : L"forge-loader.log" },
         LogTailerConfig{ latestLogPath, L"latest.log" },
         LogTailerConfig{ xboxCompatLogPath, L"xbox_compat.log" }
     };
@@ -9169,6 +9913,37 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     if (!af) {
         WriteLogF(L"FAILED args file err=%u", GetLastError());
         return false;
+    }
+
+    std::wstring effectiveClassPath = classPath;
+    if (isNeoForge) {
+        // OSHI reads oshi.properties from the classloader, not from JVM system properties.
+        // Keep a tiny override directory first on the bootstrap classpath to reduce Win32
+        // performance counter probing in the UWP sandbox.
+        const std::wstring oshiProperties =
+            L"oshi.os.windows.perfos.disabled=true\n"
+            L"oshi.os.windows.perfproc.disabled=true\n"
+            L"oshi.os.windows.perfdisk.disabled=true\n"
+            L"oshi.os.windows.loadaverage=false\n"
+            L"oshi.os.windows.cpu.utility=false\n";
+        WriteTextFile(launcherOverrideDir + L"\\oshi.properties", oshiProperties);
+        effectiveClassPath = launcherOverrideDir + L";" + classPath;
+        WriteLogF(L"NeoForge launcher override classpath directory: %s", launcherOverrideDir.c_str());
+    }
+
+    bool neoForgeStartedWithGameClassPath = false;
+    if (isNeoForge) {
+        if (NeoForgeClientArtifactsReady(exeDir, minecraftVersion, launchVersion, extraGameArgs, neoFormVersion)) {
+            size_t kept = 0, dropped = 0;
+            const std::wstring gameClassPath = BuildNeoForgeGameClassPath(effectiveClassPath, &kept, &dropped);
+            effectiveClassPath = gameClassPath;
+            neoForgeStartedWithGameClassPath = true;
+            WriteTextFile(launcherLogDir + L"\\java_classpath_final.txt", effectiveClassPath);
+            WriteLogF(L"NeoForge starting JVM with narrowed game class-path kept=%zu dropped=%zu", kept, dropped);
+        } else {
+            WriteTextFile(launcherLogDir + L"\\java_classpath_final.txt", effectiveClassPath);
+            WriteLog(L"NeoForge client artifacts are not complete before JVM startup; using prep class-path first");
+        }
     }
 
     std::vector<std::string> vmOptionStorage;
@@ -9205,12 +9980,49 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     } else {
         WriteLogF(L"Java ZipFS realpath patch missing: %s", javaZipfsPatch.c_str());
     }
+    if (isNeoForge) {
+        const std::wstring secureJarHandlerPatchName = L"securejarhandler-uwp-patch.jar";
+        const std::wstring localSecureJarHandlerPatch = exeDir + L"\\" + secureJarHandlerPatchName;
+        const std::wstring packagedSecureJarHandlerPatch = packageDir + L"\\" + secureJarHandlerPatchName;
+        const std::wstring secureJarHandlerPatch =
+            GetFileAttributesW(localSecureJarHandlerPatch.c_str()) != INVALID_FILE_ATTRIBUTES
+                ? localSecureJarHandlerPatch
+                : packagedSecureJarHandlerPatch;
+        if (GetFileAttributesW(secureJarHandlerPatch.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            vmOptionStorage.push_back("--patch-module=cpw.mods.securejarhandler=" + w2a(fwd(secureJarHandlerPatch)));
+            WriteLogF(L"NeoForge securejarhandler UWP patch enabled: %s", secureJarHandlerPatch.c_str());
+        } else {
+            WriteLogF(L"NeoForge securejarhandler UWP patch missing: %s", secureJarHandlerPatch.c_str());
+        }
+        if (!neoForgeMinecraftSrgJar.empty()) {
+            vmOptionStorage.push_back("-Dbanditvault.neoforge.minecraftSrgJar=" + w2a(fwd(neoForgeMinecraftSrgJar)));
+            WriteLogF(L"NeoForge Minecraft SRG fallback jar: %s", neoForgeMinecraftSrgJar.c_str());
+        }
+    }
     vmOptionStorage.push_back("-Djava.home=" + w2a(fwd(jreDir)));
     vmOptionStorage.push_back("-Djava.security.properties==" + w2a(fwd(jreDir + L"\\conf\\security\\xbox.properties")));
     vmOptionStorage.push_back("-Djava.security.egd=file:/dev/urandom");
-    vmOptionStorage.push_back("-Dfabric.log.file=" + w2a(fwd(fabricLogPath)));
-    vmOptionStorage.push_back("-Dfabric.log.level=debug");
-    vmOptionStorage.push_back("-Dfabric.debug.throwDirectly=true");
+    if (isFabric) {
+        vmOptionStorage.push_back("-Dfabric.log.file=" + w2a(fwd(fabricLogPath)));
+        vmOptionStorage.push_back("-Dfabric.log.level=debug");
+        vmOptionStorage.push_back("-Dfabric.debug.throwDirectly=true");
+    } else {
+        vmOptionStorage.push_back("-Dforge.logging.console.level=debug");
+        vmOptionStorage.push_back("-Dforge.logging.markers=REGISTRIES");
+        vmOptionStorage.push_back("-Dneoforge.logging.console.level=debug");
+        if (isNeoForge) {
+            vmOptionStorage.push_back("-Dbanditvault.securejarhandler.debug=true");
+        }
+    }
+    for (const std::wstring& arg : extraJvmArgs) {
+        const std::wstring expanded = expandLaunchArg(arg);
+        if (!expanded.empty()) {
+            vmOptionStorage.push_back(w2a(expanded));
+        }
+    }
+    if (isNeoForge) {
+        WriteLog(L"NeoForge using installer-provided ignoreList without launcher override");
+    }
     vmOptionStorage.push_back("-Dmixin.debug.verbose=true");
     vmOptionStorage.push_back("-Djava.io.tmpdir=" + w2a(fwd(jnaTmpDir)));
     vmOptionStorage.push_back("-Djna.tmpdir=" + w2a(fwd(jnaTmpDir)));
@@ -9243,31 +10055,33 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         WriteLogF(L"LWJGL OpenGL library override missing: %s", selectedOpenGl.c_str());
     }
     WriteLogF(L"Log4j configuration: %s", FileUriFromPath(logConfigPath).c_str());
-    vmOptionStorage.push_back("-Dfabric.gameJarPath=" + w2a(fwd(clientJar)));
-    vmOptionStorage.push_back("-Dfabric.modsFolder=" + w2a(fwd(userModsDir)));
-    std::vector<std::wstring> fabricAddMods;
-    if (DirectoryExists(bundledModsDir)) {
-        fabricAddMods.push_back(bundledModsDir);
-    }
-    if (launchVersion.find(L"fabric-loader-0.14.") != std::wstring::npos &&
-        DirectoryExists(userModsDir)) {
-        fabricAddMods.push_back(userModsDir);
-    }
-    if (!fabricAddMods.empty()) {
-        std::wstring addModsValue;
-        for (const std::wstring& path : fabricAddMods) {
-            if (!addModsValue.empty()) addModsValue += L";";
-            addModsValue += fwd(path);
+    if (isFabric) {
+        vmOptionStorage.push_back("-Dfabric.gameJarPath=" + w2a(fwd(clientJar)));
+        vmOptionStorage.push_back("-Dfabric.modsFolder=" + w2a(fwd(userModsDir)));
+        std::vector<std::wstring> fabricAddMods;
+        if (DirectoryExists(bundledModsDir)) {
+            fabricAddMods.push_back(bundledModsDir);
         }
-        vmOptionStorage.push_back("-Dfabric.addMods=" + w2a(addModsValue));
-        WriteLogF(L"Fabric addMods paths: %s", addModsValue.c_str());
+        if (launchVersion.find(L"fabric-loader-0.14.") != std::wstring::npos &&
+            DirectoryExists(userModsDir)) {
+            fabricAddMods.push_back(userModsDir);
+        }
+        if (!fabricAddMods.empty()) {
+            std::wstring addModsValue;
+            for (const std::wstring& path : fabricAddMods) {
+                if (!addModsValue.empty()) addModsValue += L";";
+                addModsValue += fwd(path);
+            }
+            vmOptionStorage.push_back("-Dfabric.addMods=" + w2a(addModsValue));
+            WriteLogF(L"Fabric addMods paths: %s", addModsValue.c_str());
+        }
     }
-    vmOptionStorage.push_back("-Djava.class.path=" + w2a(classPath));
+    vmOptionStorage.push_back("-Djava.class.path=" + w2a(effectiveClassPath));
     vmOptionStorage.push_back("-Duser.dir=" + w2a(fwd(gameDir)));
     vmOptionStorage.push_back("-Dlog4j.configurationFile=" + w2a(FileUriFromPath(logConfigPath)));
     vmOptionStorage.push_back("-XX:ErrorFile=" + w2a(fwd(gameDir + L"\\hs_err_pid%p.log")));
 
-    const std::vector<std::string> appArgs = {
+    std::vector<std::string> appArgs = {
         "--username", authConfig.username,
         "--version", w2a(launchVersion),
         "--gameDir", w2a(fwd(gameDir)),
@@ -9277,12 +10091,22 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         "--accessToken", authConfig.accessToken,
         "--versionType", "release"
     };
+    for (const std::wstring& arg : extraGameArgs) {
+        appArgs.push_back(w2a(expandLaunchArg(arg)));
+    }
+    if (isNeoForge && !neoForgeUniversalJar.empty()) {
+        if (GetFileAttributesW(neoForgeUniversalJar.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            WriteLogF(L"NeoForge universal jar available for launch-handler discovery: %s", neoForgeUniversalJar.c_str());
+        } else {
+            WriteLogF(L"NeoForge universal jar missing for launch-handler discovery: %s", neoForgeUniversalJar.c_str());
+        }
+    }
 
     fprintf(af, "# JVM options\n");
     for (const auto& opt : vmOptionStorage) {
         fprintf(af, "%s\n", opt.c_str());
     }
-    fprintf(af, "# Main class\nnet.fabricmc.loader.impl.launch.knot.KnotClient\n");
+    fprintf(af, "# Main class\n%s\n", w2a(effectiveMainClass).c_str());
     fprintf(af, "# App args\n");
     for (const auto& arg : appArgs) {
         fprintf(af, "%s\n", arg.c_str());
@@ -9321,8 +10145,37 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         return false;
     }
 
-    jclass mainClass = env->FindClass("net/fabricmc/loader/impl/launch/knot/KnotClient");
-    if (!mainClass || CheckAndLogJavaException(env, L"FindClass(KnotClient)")) {
+    if (isNeoForge) {
+        if (neoForgeStartedWithGameClassPath) {
+            WriteLog(L"NeoForge client artifact prep skipped; artifacts were complete before JVM startup");
+        } else {
+            WriteLogF(L"Running NeoForge prep for loaderVersion=%s", loaderVersion.c_str());
+            if (!PrepareNeoForgeClientArtifacts(
+                    env,
+                    exeDir,
+                    clientJar,
+                    minecraftVersion,
+                    launchVersion,
+                    extraGameArgs,
+                    neoFormVersion,
+                    neoForgeInstallToolsVersion,
+                    neoForgeJarSplitterVersion,
+                    neoForgeBinaryPatcherVersion,
+                    neoForgeAutoRenamingToolVersion)) {
+                WriteLog(L"NeoForge client artifact preparation failed");
+                return false;
+            }
+
+            size_t kept = 0, dropped = 0;
+            const std::wstring gameClassPath = BuildNeoForgeGameClassPath(effectiveClassPath, &kept, &dropped);
+            SetJavaSystemProperty(env, L"java.class.path", gameClassPath);
+            WriteTextFile(launcherLogDir + L"\\java_classpath_final.txt", gameClassPath);
+            WriteLogF(L"NeoForge game class-path narrowed after prep kept=%zu dropped=%zu", kept, dropped);
+        }
+    }
+
+    jclass mainClass = env->FindClass(w2a(mainClassPath).c_str());
+    if (!mainClass || CheckAndLogJavaException(env, (L"FindClass(" + effectiveMainClass + L")").c_str())) {
         return false;
     }
 
@@ -9353,7 +10206,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         }
     }
 
-    WriteLog(L"Invoking KnotClient.main via embedded JVM");
+    WriteLogF(L"Invoking %s.main via embedded JVM", effectiveMainClass.c_str());
     WriteTextFile(CrashLaunchMarkerPath(exeDir),
         std::wstring(L"minecraftVersion=") + minecraftVersion + L"\n" +
         L"launchVersion=" + launchVersion + L"\n" +
@@ -9361,15 +10214,15 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         L"gameDir=" + gameDir + L"\n" +
         L"nativesDir=" + nativesDir + L"\n");
     std::atomic<bool> javaMainRunning{ true };
-    std::thread javaMainWatchdog([&javaMainRunning, vm]() {
+    std::thread javaMainWatchdog([&javaMainRunning, vm, effectiveMainClass]() {
         unsigned seconds = 0;
         while (javaMainRunning.load()) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
             seconds += 5;
             if (javaMainRunning.load()) {
-                WriteLogF(L"KnotClient.main still running after %u seconds", seconds);
+                WriteLogF(L"%s.main still running after %u seconds", effectiveMainClass.c_str(), seconds);
                 if (seconds == 15 || (seconds >= 30 && (seconds % 30) == 0)) {
-                    DumpJavaThreadStacks(vm, L"KnotClient.main watchdog");
+                    DumpJavaThreadStacks(vm, (effectiveMainClass + L".main watchdog").c_str());
                 }
             }
         }
@@ -9401,7 +10254,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
         return false;
     }
 
-    WriteLog(L"KnotClient.main returned");
+    WriteLogF(L"%s.main returned", effectiveMainClass.c_str());
     g_minecraftRunning.store(false);
     WriteLog(L"Minecraft exited normally; returning to launcher menu");
     StopLogTailers();
@@ -9589,11 +10442,12 @@ public:
             selectedTarget.loaderVersion.c_str());
         const MinecraftVersionInfo selectedInfo = ResolveVersionInfo(packageDir, exeDir, selectedTarget);
         if (!selectedInfo.supported) {
-            WriteLogF(L"Unsupported launch target: %s manifest=%s assetIndex=%s launchVersion=%s loaderJar=%s bundledMods=%s",
+            WriteLogF(L"Unsupported launch target: %s manifest=%s assetIndex=%s launchVersion=%s mainClass=%s loaderJar=%s bundledMods=%s",
                 selectedTarget.targetId.c_str(),
                 selectedInfo.manifestPath.empty() ? L"(none)" : selectedInfo.manifestPath.c_str(),
                 selectedInfo.assetIndex.empty() ? L"(none)" : selectedInfo.assetIndex.c_str(),
                 selectedInfo.launchVersion.empty() ? L"(none)" : selectedInfo.launchVersion.c_str(),
+                selectedInfo.mainClass.empty() ? L"(none)" : selectedInfo.mainClass.c_str(),
                 selectedInfo.loaderJar.empty() ? L"(none)" : selectedInfo.loaderJar.c_str(),
                 selectedInfo.bundledModsDir.empty() ? L"(none)" : selectedInfo.bundledModsDir.c_str());
             AuthScreenRenderer unsupportedRendererInstance;
@@ -9640,11 +10494,12 @@ public:
         EnsureProfilesInitialized(exeDir);
         const LaunchTarget launchTarget = ResolveProfileTarget(exeDir, GetProfileById(exeDir, GetActiveProfileId(exeDir)));
         const MinecraftVersionInfo versionInfo = ResolveVersionInfo(packageDir, exeDir, launchTarget);
-        WriteLogF(L"Launch target=%s manifest=%s assetIndex=%s launchVersion=%s loaderJar=%s bundledMods=%s supported=%d",
+        WriteLogF(L"Launch target=%s manifest=%s assetIndex=%s launchVersion=%s mainClass=%s loaderJar=%s bundledMods=%s supported=%d",
             versionInfo.targetId.c_str(),
             versionInfo.manifestPath.empty() ? L"(none)" : versionInfo.manifestPath.c_str(),
             versionInfo.assetIndex.empty() ? L"(none)" : versionInfo.assetIndex.c_str(),
             versionInfo.launchVersion.empty() ? L"(none)" : versionInfo.launchVersion.c_str(),
+            versionInfo.mainClass.empty() ? L"(none)" : versionInfo.mainClass.c_str(),
             versionInfo.loaderJar.empty() ? L"(none)" : versionInfo.loaderJar.c_str(),
             versionInfo.bundledModsDir.empty() ? L"(none)" : versionInfo.bundledModsDir.c_str(),
             versionInfo.supported ? 1 : 0);
@@ -9731,6 +10586,8 @@ public:
             WriteLogF(L"Falling back to default natives for target=%s", versionInfo.targetId.c_str());
         }
         const std::wstring minecraftVersion = versionInfo.minecraftVersion;
+        const bool isFabricLaunch = _wcsicmp(versionInfo.loader.c_str(), L"fabric") == 0;
+        const bool isNeoForgeLaunch = _wcsicmp(versionInfo.loader.c_str(), L"neoforge") == 0;
         const std::wstring packageRuntimeDir = packageDir + L"\\runtime";
         const std::wstring packagedLibrariesDir = packageRuntimeDir + L"\\libraries";
         const std::wstring bundledModsDir = versionInfo.bundledModsDir;
@@ -9764,6 +10621,27 @@ public:
         WriteLogF(L"java.exe  exists=%d", GetFileAttributesW(javaExe.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"gameDir   exists=%d", GetFileAttributesW(gameDir.c_str()) != INVALID_FILE_ATTRIBUTES);
         WriteLogF(L"clientJar exists=%d", GetFileAttributesW(clientJar.c_str()) != INVALID_FILE_ATTRIBUTES);
+        if (isNeoForgeLaunch) {
+            if (DirectoryExists(packagedLibrariesDir)) {
+                CopyDirectoryContentsAlways(packagedLibrariesDir, sharedGameDir + L"\\libraries");
+                WriteLogF(L"Deployed bundled NeoForge client artifacts into %s\\libraries with overwrite", sharedGameDir.c_str());
+            }
+            const std::wstring neoForgeVersion = NeoForgeVersionFromLaunchVersion(versionInfo.launchVersion);
+            const std::wstring neoFormVersion = !versionInfo.neoFormVersion.empty()
+                ? versionInfo.neoFormVersion
+                : FirstArgValue(versionInfo.extraGameArgs, L"--fml.neoFormVersion");
+            if (!neoForgeVersion.empty() && !neoFormVersion.empty()) {
+                const std::wstring mcAndNeoForm = minecraftVersion + L"-" + neoFormVersion;
+                const std::wstring srgJar = sharedGameDir + L"\\libraries\\" +
+                    MavenPath(L"net.minecraft", L"client", mcAndNeoForm, L"srg");
+                WriteLogF(L"NeoForge SRG after deployment: %s", NeoForgeSrgJarSummary(srgJar).c_str());
+            }
+            DeleteDirectoryTree(gameDir + L"\\.cache");
+            DeleteDirectoryTree(sharedGameDir + L"\\.cache");
+            DeleteDirectoryTree(gameDir + L"\\config\\.cache");
+            DeleteDirectoryTree(gameDir + L"\\mods\\.index");
+            EnsureNeoForgeFmlConfig(gameDir);
+        }
 
         const bool legacyOpenGlContext = CompareVersionNumbers(w2a(minecraftVersion), "1.17") < 0;
         SetEnvironmentVariableW(L"MC_LEGACY_OPENGL_CONTEXT", legacyOpenGlContext ? L"1" : L"0");
@@ -9772,7 +10650,7 @@ public:
         std::vector<std::wstring> jars;
         if (!versionInfo.loaderJar.empty()) {
             jars.push_back(versionInfo.loaderJar);
-        } else {
+        } else if (isFabricLaunch) {
             CollectJars(packagedLibrariesDir, jars);
         }
         CollectManifestLibraryJars(effManifestPath, exeDir, packageDir, jars);
@@ -9807,6 +10685,16 @@ public:
                 effLaunchVersion,
                 effAssetIndex,
                 minecraftVersion,
+                versionInfo.loader,
+                versionInfo.loaderVersion,
+                versionInfo.mainClass,
+                versionInfo.extraJvmArgs,
+                versionInfo.extraGameArgs,
+                versionInfo.neoFormVersion,
+                versionInfo.neoForgeInstallToolsVersion,
+                versionInfo.neoForgeJarSplitterVersion,
+                versionInfo.neoForgeBinaryPatcherVersion,
+                versionInfo.neoForgeAutoRenamingToolVersion,
                 authConfig)) {
             g_minecraftRunning.store(false);
             WriteLog(L"Embedded JVM launch failed");

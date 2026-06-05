@@ -45,6 +45,7 @@
 /natives/
 /natives-1.21/
 /fabric-installer.jar
+/prebuilt/
 
 # Packaged / bundled runtimes
 /jre/
