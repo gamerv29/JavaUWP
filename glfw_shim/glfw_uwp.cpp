@@ -353,19 +353,29 @@ static GLFWjoystickfun        g_joystick_cb    = NULL;
 static GLFWmonitorfun         g_monitor_cb     = NULL;
 using CoreWindowKeyHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CUI__CCore__CCoreWindow_Windows__CUI__CCore__CKeyEventArgs_t;
 using CoreWindowCharHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CUI__CCore__CCoreWindow_Windows__CUI__CCore__CCharacterReceivedEventArgs_t;
+using CoreWindowVisibilityHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CUI__CCore__CCoreWindow_Windows__CUI__CCore__CVisibilityChangedEventArgs_t;
+using CoreWindowActivatedHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CUI__CCore__CCoreWindow_Windows__CUI__CCore__CWindowActivatedEventArgs_t;
 static ComPtr<CoreWindowKeyHandler> g_keyDownHandler;
 static ComPtr<CoreWindowKeyHandler> g_keyUpHandler;
 static ComPtr<CoreWindowCharHandler> g_charReceivedHandler;
+static ComPtr<CoreWindowVisibilityHandler> g_visibilityHandler;
+static ComPtr<CoreWindowActivatedHandler> g_activatedHandler;
 static ComPtr<IGameInput> g_gameInput;
 static EventRegistrationToken g_keyDownToken = {};
 static EventRegistrationToken g_keyUpToken = {};
 static EventRegistrationToken g_charReceivedToken = {};
+static EventRegistrationToken g_visibilityToken = {};
+static EventRegistrationToken g_activatedToken = {};
 static bool g_keyboardHooksInstalled = false;
+static bool g_lifecycleHooksInstalled = false;
 static bool g_gameInputCreateTried = false;
 static bool g_gamepad_present = false;
 static bool g_haveGameInputGamepadState = false;
 static bool g_haveGameInputPollCache = false;
 static ULONGLONG g_lastGameInputPollMs = 0;
+static volatile LONG g_coreWindowVisibleForInput = 1;
+static volatile LONG g_coreWindowActivatedForInput = 1;
+static volatile LONGLONG g_coreWindowInputStateChangedMs = 0;
 static bool g_legacyControllerModModeLogged = false;
 static bool g_lastLegacyControllerModMode = false;
 static unsigned char g_key_state[512] = {};
@@ -676,7 +686,35 @@ static void UpdateKeyState(int key, int action) {
     g_key_state[key] = (action == GLFW_RELEASE) ? GLFW_RELEASE : GLFW_PRESS;
 }
 
+static void ClearKeyboardState() {
+    ZeroMemory(g_key_state, sizeof(g_key_state));
+}
+
+static void ClearGamepadState() {
+    ZeroMemory(&g_gamepad_state, sizeof(g_gamepad_state));
+    ZeroMemory(g_joystick_axes, sizeof(g_joystick_axes));
+    ZeroMemory(g_joystick_buttons, sizeof(g_joystick_buttons));
+}
+
+static void MarkCoreWindowInputStateChanged() {
+    InterlockedExchange64(&g_coreWindowInputStateChangedMs, (LONGLONG)GetTickCount64());
+}
+
+static bool CoreWindowAcceptsInput() {
+    if (InterlockedCompareExchange(&g_coreWindowVisibleForInput, 1, 1) == 0 ||
+        InterlockedCompareExchange(&g_coreWindowActivatedForInput, 1, 1) == 0) {
+        return false;
+    }
+    const LONGLONG changed = InterlockedCompareExchange64(&g_coreWindowInputStateChangedMs, 0, 0);
+    return changed == 0 || ((LONGLONG)GetTickCount64() - changed) >= 250;
+}
+
 static void DispatchKeyEvent(VirtualKey virtualKey, const CorePhysicalKeyStatus& status, int action) {
+    if (!CoreWindowAcceptsInput()) {
+        ClearKeyboardState();
+        return;
+    }
+
     const int glfwKey = MapVirtualKeyToGlfw(virtualKey);
     if (glfwKey == GLFW_KEY_UNKNOWN) return;
 
@@ -694,6 +732,7 @@ static void DispatchKeyEvent(VirtualKey virtualKey, const CorePhysicalKeyStatus&
 }
 
 static void DispatchCharEvent(unsigned int codepoint) {
+    if (!CoreWindowAcceptsInput()) return;
     if (codepoint == 0) return;
     if (g_char_cb) {
         g_char_cb((GLFWwindow*)&g_fake_window, codepoint);
@@ -754,9 +793,7 @@ static unsigned char GamepadButton(GameInputGamepadButtons buttons, GameInputGam
 }
 
 static void ConvertGameInputGamepadState(const GameInputGamepadState& state) {
-    ZeroMemory(&g_gamepad_state, sizeof(g_gamepad_state));
-    ZeroMemory(g_joystick_axes, sizeof(g_joystick_axes));
-    ZeroMemory(g_joystick_buttons, sizeof(g_joystick_buttons));
+    ClearGamepadState();
 
     g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_A] = GamepadButton(state.buttons, GameInputGamepadA);
     g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_B] = GamepadButton(state.buttons, GameInputGamepadB);
@@ -788,6 +825,11 @@ static void ConvertGameInputGamepadState(const GameInputGamepadState& state) {
 static bool PollGameInputGamepad(bool fireCallbacks) {
     if (!EnsureGameInput()) return false;
 
+    if (!CoreWindowAcceptsInput()) {
+        ClearGamepadState();
+        return g_gamepad_present;
+    }
+
     const ULONGLONG nowMs = GetTickCount64();
     if (g_haveGameInputPollCache && nowMs - g_lastGameInputPollMs <= 4) {
         return g_gamepad_present;
@@ -804,9 +846,7 @@ static bool PollGameInputGamepad(bool fireCallbacks) {
     g_gamepad_present = present;
 
     if (!present) {
-        ZeroMemory(&g_gamepad_state, sizeof(g_gamepad_state));
-        ZeroMemory(g_joystick_axes, sizeof(g_joystick_axes));
-        ZeroMemory(g_joystick_buttons, sizeof(g_joystick_buttons));
+        ClearGamepadState();
         g_haveGameInputGamepadState = false;
 
         if (previousPresent && fireCallbacks && g_joystick_cb) {
@@ -912,6 +952,60 @@ static bool InstallKeyboardHooks() {
     return true;
 }
 
+static void InstallCoreWindowLifecycleHooks() {
+    if (g_lifecycleHooksInstalled || !g_coreWindow) return;
+
+    g_visibilityHandler = Callback<CoreWindowVisibilityHandler>(
+        [](ICoreWindow*, IVisibilityChangedEventArgs* args) -> HRESULT {
+            boolean visible = true;
+            if (args) {
+                args->get_Visible(&visible);
+            }
+            const LONG next = visible ? 1 : 0;
+            const LONG old = InterlockedExchange(&g_coreWindowVisibleForInput, next);
+            if (old != next) {
+                MarkCoreWindowInputStateChanged();
+                ClearKeyboardState();
+                ClearGamepadState();
+                ShimLog("CoreWindow VisibilityChanged visible=%d", next);
+            }
+            return S_OK;
+        });
+
+    HRESULT hr = g_coreWindow->add_VisibilityChanged(g_visibilityHandler.Get(), &g_visibilityToken);
+    if (FAILED(hr)) {
+        ShimLog("add_VisibilityChanged failed hr=0x%08X", hr);
+    }
+
+    g_activatedHandler = Callback<CoreWindowActivatedHandler>(
+        [](ICoreWindow*, IWindowActivatedEventArgs* args) -> HRESULT {
+            CoreWindowActivationState state = CoreWindowActivationState_CodeActivated;
+            if (args) {
+                args->get_WindowActivationState(&state);
+            }
+            const LONG next = state == CoreWindowActivationState_Deactivated ? 0 : 1;
+            const LONG old = InterlockedExchange(&g_coreWindowActivatedForInput, next);
+            if (old != next) {
+                MarkCoreWindowInputStateChanged();
+                ClearKeyboardState();
+                ClearGamepadState();
+                ShimLog("CoreWindow Activated state=%d active=%d", (int)state, next);
+            }
+            if (g_focus_cb) {
+                g_focus_cb((GLFWwindow*)&g_fake_window, next ? GLFW_TRUE : GLFW_FALSE);
+            }
+            return S_OK;
+        });
+
+    hr = g_coreWindow->add_Activated(g_activatedHandler.Get(), &g_activatedToken);
+    if (FAILED(hr)) {
+        ShimLog("add_Activated failed hr=0x%08X", hr);
+    }
+
+    g_lifecycleHooksInstalled = true;
+    ShimLog("CoreWindow lifecycle hooks installed");
+}
+
 // ---------------------------------------------------------------------------
 // CoreWindow access
 // ---------------------------------------------------------------------------
@@ -964,6 +1058,7 @@ static bool AcquireCoreWindow() {
     }
 
     g_coreWindow->get_Dispatcher(g_dispatcher.GetAddressOf());
+    InstallCoreWindowLifecycleHooks();
     InstallKeyboardHooks();
     return true;
 }
@@ -1546,9 +1641,10 @@ extern "C" __declspec(dllexport) int glfwGetWindowAttrib(GLFWwindow*, int a) {
     }
     switch (a) {
     case GLFW_VISIBLE:
-    case GLFW_FOCUSED:
     case GLFW_HOVERED:
         return GLFW_TRUE;
+    case GLFW_FOCUSED:
+        return CoreWindowAcceptsInput() ? GLFW_TRUE : GLFW_FALSE;
     case GLFW_MAXIMIZED:
         return GLFW_FALSE;
     case GLFW_CLIENT_API:

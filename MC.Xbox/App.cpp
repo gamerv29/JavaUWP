@@ -91,11 +91,17 @@ static ComPtr<ICoreWindow> g_authWindow;
 static std::atomic<bool> g_minecraftRunning{ false };
 using CoreWindowClosedHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CUI__CCore__CCoreWindow_Windows__CUI__CCore__CCoreWindowEventArgs_t;
 using CoreWindowVisibilityHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CUI__CCore__CCoreWindow_Windows__CUI__CCore__CVisibilityChangedEventArgs_t;
+using CoreWindowActivatedHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CUI__CCore__CCoreWindow_Windows__CUI__CCore__CWindowActivatedEventArgs_t;
 static ComPtr<CoreWindowClosedHandler> g_coreWindowClosedHandler;
 static ComPtr<CoreWindowVisibilityHandler> g_coreWindowVisibilityHandler;
+static ComPtr<CoreWindowActivatedHandler> g_coreWindowActivatedHandler;
 static EventRegistrationToken g_coreWindowClosedToken = {};
 static EventRegistrationToken g_coreWindowVisibilityToken = {};
+static EventRegistrationToken g_coreWindowActivatedToken = {};
 static bool g_coreWindowLifecycleHooksInstalled = false;
+static std::atomic<bool> g_coreWindowVisibleForInput{ true };
+static std::atomic<bool> g_coreWindowActivatedForInput{ true };
+static std::atomic<unsigned long long> g_coreWindowInputStateChangedMs{ 0 };
 static volatile LONG g_logTailerRunning = 0;
 static HANDLE g_logTailerThreads[8] = {};
 static int g_logTailerThreadCount = 0;
@@ -832,6 +838,18 @@ static void LogLifecycleEvent(const wchar_t* reason) {
         g_minecraftRunning.load() ? 1 : 0);
 }
 
+static void MarkCoreWindowInputStateChanged() {
+    g_coreWindowInputStateChangedMs.store(static_cast<unsigned long long>(GetTickCount64()));
+}
+
+static bool CoreWindowAcceptsInput() {
+    if (!g_coreWindowVisibleForInput.load() || !g_coreWindowActivatedForInput.load()) {
+        return false;
+    }
+    const unsigned long long changed = g_coreWindowInputStateChangedMs.load();
+    return changed == 0 || (static_cast<unsigned long long>(GetTickCount64()) - changed) >= 250ULL;
+}
+
 static void RegisterLifecycleHandlers(ICoreApplication* coreApp) {
     if (!coreApp) return;
 
@@ -908,6 +926,10 @@ static void RegisterCoreWindowLifecycleHandlers(ICoreWindow* window) {
             if (args) {
                 args->get_Visible(&visible);
             }
+            const bool oldVisible = g_coreWindowVisibleForInput.exchange(visible ? true : false);
+            if (oldVisible != (visible ? true : false)) {
+                MarkCoreWindowInputStateChanged();
+            }
             WriteLogF(L"CoreWindow VisibilityChanged visible=%d minecraftRunning=%d",
                 visible ? 1 : 0,
                 g_minecraftRunning.load() ? 1 : 0);
@@ -917,6 +939,29 @@ static void RegisterCoreWindowLifecycleHandlers(ICoreWindow* window) {
     hr = window->add_VisibilityChanged(g_coreWindowVisibilityHandler.Get(), &g_coreWindowVisibilityToken);
     if (FAILED(hr)) {
         WriteLogF(L"CoreWindow add_VisibilityChanged failed hr=0x%08X", hr);
+    }
+
+    g_coreWindowActivatedHandler = Callback<CoreWindowActivatedHandler>(
+        [](ICoreWindow*, IWindowActivatedEventArgs* args) -> HRESULT {
+            CoreWindowActivationState state = CoreWindowActivationState_CodeActivated;
+            if (args) {
+                args->get_WindowActivationState(&state);
+            }
+            const bool active = state != CoreWindowActivationState_Deactivated;
+            const bool oldActive = g_coreWindowActivatedForInput.exchange(active);
+            if (oldActive != active) {
+                MarkCoreWindowInputStateChanged();
+            }
+            WriteLogF(L"CoreWindow Activated state=%d active=%d minecraftRunning=%d",
+                static_cast<int>(state),
+                active ? 1 : 0,
+                g_minecraftRunning.load() ? 1 : 0);
+            return S_OK;
+        });
+
+    hr = window->add_Activated(g_coreWindowActivatedHandler.Get(), &g_coreWindowActivatedToken);
+    if (FAILED(hr)) {
+        WriteLogF(L"CoreWindow add_Activated failed hr=0x%08X", hr);
     }
 
     g_coreWindowLifecycleHooksInstalled = true;
@@ -7195,6 +7240,7 @@ enum class MainMenuAction {
 };
 
 static bool IsVirtualKeyDown(ICoreWindow* window, ABI::Windows::System::VirtualKey key) {
+    if (!CoreWindowAcceptsInput()) return false;
     if (!window) return false;
     CoreVirtualKeyStates state = CoreVirtualKeyStates_None;
     if (FAILED(window->GetKeyState(key, &state))) {
