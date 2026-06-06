@@ -863,6 +863,64 @@ function Build-JavaZipfsRealpathPatch {
     Write-Host "Java ZipFS patch: $OutputJar"
 }
 
+function Build-JavaDesktopUwpAwtPatch {
+    param(
+        [Parameter(Mandatory = $true)][string]$JavaHome,
+        [Parameter(Mandatory = $true)][string]$OutputJar,
+        [Parameter(Mandatory = $true)][string]$WorkName
+    )
+
+    Write-Host "Building Java desktop UWP AWT patch: $OutputJar"
+    $javacExe = Join-Path $JavaHome "bin\javac.exe"
+    if (-not (Test-Path $javacExe)) { throw "javac.exe not found at $javacExe; Java desktop UWP AWT patch requires a JDK, not a JRE." }
+    $runtimeJarExe = Join-Path $JavaHome "bin\jar.exe"
+    if (-not (Test-Path $runtimeJarExe)) { $runtimeJarExe = $jarExe }
+    $srcZip = Join-Path $JavaHome "lib\src.zip"
+    if (-not (Test-Path $srcZip)) { throw "JDK source archive not found at $srcZip; Java desktop UWP AWT patch cannot be generated." }
+
+    $desktopPatchDir = Join-Path $buildDir $WorkName
+    $desktopPatchSrcDir = Join-Path $desktopPatchDir "src"
+    $desktopPatchClassesDir = Join-Path $desktopPatchDir "classes"
+    Remove-Item -Recurse -Force $desktopPatchDir -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path (Join-Path $desktopPatchSrcDir "sun\awt\windows"), $desktopPatchClassesDir | Out-Null
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $srcArchive = [System.IO.Compression.ZipFile]::OpenRead($srcZip)
+    try {
+        $desktopEntry = $srcArchive.Entries | Where-Object { $_.FullName -eq "java.desktop/sun/awt/windows/WDesktopProperties.java" } | Select-Object -First 1
+        if (-not $desktopEntry) { throw "WDesktopProperties.java not found inside $srcZip" }
+        $reader = [System.IO.StreamReader]::new($desktopEntry.Open())
+        try {
+            $desktopSource = $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+    } finally {
+        $srcArchive.Dispose()
+    }
+
+    $oldDesktopCall = "        getWindowsParameters();"
+    $newDesktopCall = @'
+        if (!Boolean.getBoolean("banditvault.awt.skipDesktopProperties")) {
+            getWindowsParameters();
+        }
+'@
+    if (-not $desktopSource.Contains($oldDesktopCall)) {
+        throw "WDesktopProperties.java native desktop-properties call target not found for $JavaHome."
+    }
+    $desktopSource = $desktopSource.Replace($oldDesktopCall, $newDesktopCall)
+
+    $desktopSourcePath = Join-Path $desktopPatchSrcDir "sun\awt\windows\WDesktopProperties.java"
+    [System.IO.File]::WriteAllText($desktopSourcePath, $desktopSource)
+    & $javacExe --patch-module "java.desktop=$desktopPatchSrcDir" -d $desktopPatchClassesDir $desktopSourcePath
+    if ($LASTEXITCODE -ne 0) { throw "Java desktop UWP AWT patch compile failed" }
+    Push-Location $desktopPatchClassesDir
+    & $runtimeJarExe cf $OutputJar .
+    Pop-Location
+    if ($LASTEXITCODE -ne 0) { throw "Java desktop UWP AWT patch jar creation failed" }
+    Write-Host "Java desktop UWP AWT patch: $OutputJar"
+}
+
 function Resolve-SecureJarHandlerJar {
     param([Parameter(Mandatory = $true)][string]$Version)
 
@@ -928,6 +986,8 @@ Build-JavaBaseUwpFilesystemPatch -JavaHome $jreSrc -OutputJar (Join-Path $pkg "j
 Build-JavaBaseUwpFilesystemPatch -JavaHome $jre21Src -OutputJar (Join-Path $pkg "java-base-uwp-filesystem-21.jar") -WorkName "java_base_uwp_filesystem_patch_21"
 Build-JavaZipfsRealpathPatch -JavaHome $jreSrc -OutputJar (Join-Path $pkg "java-zipfs-realpath.jar") -WorkName "java_zipfs_realpath_patch_current"
 Build-JavaZipfsRealpathPatch -JavaHome $jre21Src -OutputJar (Join-Path $pkg "java-zipfs-realpath-21.jar") -WorkName "java_zipfs_realpath_patch_21"
+Build-JavaDesktopUwpAwtPatch -JavaHome $jreSrc -OutputJar (Join-Path $pkg "java-desktop-uwp-awt.jar") -WorkName "java_desktop_uwp_awt_patch_current"
+Build-JavaDesktopUwpAwtPatch -JavaHome $jre21Src -OutputJar (Join-Path $pkg "java-desktop-uwp-awt-21.jar") -WorkName "java_desktop_uwp_awt_patch_21"
 Build-SecureJarHandlerUwpPatch -JavaHome $jre21Src -Version "3.0.8" -OutputJar (Join-Path $pkg "securejarhandler-uwp-patch.jar")
 
 Write-Host "Generating UWP tile assets..."

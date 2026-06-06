@@ -227,6 +227,11 @@ static std::wstring GetParentDir(const std::wstring& path) {
     return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
 }
 
+static std::wstring GetFileName(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
 using RuntimeSeedProgressCallback = std::function<void(const wchar_t*, const wchar_t*, float)>;
 
 static std::wstring FileStamp(const std::wstring& path) {
@@ -245,20 +250,89 @@ static std::wstring FileStamp(const std::wstring& path) {
 }
 
 static bool ReadTextFile(const std::wstring& path, std::wstring& out) {
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+    int fd = -1;
+    if (_wsopen_s(&fd, path.c_str(), _O_RDONLY | _O_BINARY, _SH_DENYNO, _S_IREAD) != 0 || fd < 0) {
+        return false;
+    }
 
     std::string bytes;
     char buffer[4096];
     while (true) {
-        const size_t read = fread(buffer, 1, sizeof(buffer), f);
+        const int read = _read(fd, buffer, sizeof(buffer));
         if (read > 0) bytes.append(buffer, read);
-        if (read < sizeof(buffer)) break;
+        if (read < static_cast<int>(sizeof(buffer))) break;
     }
-    fclose(f);
+    _close(fd);
 
     out = a2w(bytes.c_str());
     return true;
+}
+
+static std::wstring TailTextForUi(const std::wstring& text, size_t maxLines = 14, size_t maxChars = 4200) {
+    if (text.empty()) return L"Waiting for pre-launch log output...";
+
+    size_t end = text.size();
+    while (end > 0 && (text[end - 1] == L'\r' || text[end - 1] == L'\n')) {
+        --end;
+    }
+    size_t start = end;
+    size_t lines = 0;
+    while (start > 0 && lines < maxLines) {
+        --start;
+        if (text[start] == L'\n') {
+            ++lines;
+        }
+    }
+    if (lines >= maxLines && start < end) {
+        ++start;
+    }
+    if (end > start && end - start > maxChars) {
+        start = end - maxChars;
+        while (start < end && text[start] != L'\n') {
+            ++start;
+        }
+        if (start < end) {
+            ++start;
+        }
+    }
+
+    std::wstring tail = text.substr(start, end - start);
+    tail.erase(std::remove(tail.begin(), tail.end(), L'\r'), tail.end());
+    for (wchar_t& ch : tail) {
+        if (ch == L'\t') ch = L' ';
+    }
+    if (tail.empty()) return L"Waiting for pre-launch log output...";
+
+    // The launch panel is not interactive, so keep each logical log line to one
+    // visual row. Very long paths otherwise wrap and hide the newest entries.
+    constexpr size_t maxLineChars = 150;
+    std::wstring compact;
+    size_t lineStart = 0;
+    while (lineStart <= tail.size()) {
+        size_t lineEnd = tail.find(L'\n', lineStart);
+        if (lineEnd == std::wstring::npos) lineEnd = tail.size();
+        std::wstring line = tail.substr(lineStart, lineEnd - lineStart);
+        if (line.size() > maxLineChars) {
+            constexpr size_t headChars = 96;
+            constexpr size_t tailChars = maxLineChars - headChars - 5;
+            line = line.substr(0, headChars) + L" ... " + line.substr(line.size() - tailChars);
+        }
+        if (!compact.empty()) compact += L'\n';
+        compact += line;
+        if (lineEnd >= tail.size()) break;
+        lineStart = lineEnd + 1;
+    }
+    return compact.empty() ? L"Waiting for pre-launch log output..." : compact;
+}
+
+static std::wstring ReadLaunchLogTailForUi(const std::vector<std::wstring>& paths, size_t maxLines = 9) {
+    for (const std::wstring& path : paths) {
+        std::wstring text;
+        if (ReadTextFile(path, text) && !text.empty()) {
+            return TailTextForUi(text, maxLines);
+        }
+    }
+    return L"Waiting for pre-launch log output...";
 }
 
 static bool WriteTextFile(const std::wstring& path, const std::wstring& value) {
@@ -511,6 +585,82 @@ static bool WriteStoredZip(const std::wstring& zipPath, std::vector<CrashZipEntr
     return ok;
 }
 
+static bool RewriteZipTextEntry(
+    const std::wstring& zipPath,
+    const char* entryName,
+    const std::wstring& replacementText,
+    const std::wstring& backupPath) {
+    std::ifstream in(zipPath, std::ios::binary);
+    if (!in) return false;
+    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (bytes.empty()) return false;
+
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_mem(&zip, bytes.data(), bytes.size(), 0)) return false;
+
+    std::vector<CrashZipEntry> entries;
+    const mz_uint count = mz_zip_reader_get_num_files(&zip);
+    bool replaced = false;
+    for (mz_uint i = 0; i < count; ++i) {
+        mz_zip_archive_file_stat st{};
+        if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
+        std::string name = st.m_filename ? st.m_filename : "";
+        if (name.empty()) continue;
+        if (mz_zip_reader_is_file_a_directory(&zip, i)) continue;
+
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        auto endsWith = [](const std::string& value, const char* suffix) {
+            const size_t suffixLen = std::strlen(suffix);
+            return value.size() >= suffixLen && value.compare(value.size() - suffixLen, suffixLen, suffix) == 0;
+        };
+        if (lower.rfind("meta-inf/", 0) == 0 &&
+            (endsWith(lower, ".sf") || endsWith(lower, ".rsa") || endsWith(lower, ".dsa") || endsWith(lower, ".ec"))) {
+            continue;
+        }
+
+        CrashZipEntry out;
+        out.name = name;
+        if (_stricmp(name.c_str(), entryName) == 0) {
+            const std::string replacement = w2a(replacementText);
+            out.data.assign(replacement.begin(), replacement.end());
+            replaced = true;
+        } else {
+            size_t outSize = 0;
+            void* p = mz_zip_reader_extract_to_heap(&zip, i, &outSize, 0);
+            if (!p) {
+                mz_zip_reader_end(&zip);
+                return false;
+            }
+            const unsigned char* data = static_cast<const unsigned char*>(p);
+            out.data.assign(data, data + outSize);
+            mz_free(p);
+        }
+        out.crc = static_cast<mz_uint32>(mz_crc32(MZ_CRC32_INIT, out.data.data(), out.data.size()));
+        entries.push_back(std::move(out));
+    }
+    mz_zip_reader_end(&zip);
+
+    if (!replaced || entries.empty()) return false;
+    if (!backupPath.empty() && GetFileAttributesW(backupPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        EnsureDirectoryTree(GetParentDir(backupPath));
+        CopyFileW(zipPath.c_str(), backupPath.c_str(), FALSE);
+    }
+
+    const std::wstring tempPath = zipPath + L".rewrite";
+    DeleteFileW(tempPath.c_str());
+    if (!WriteStoredZip(tempPath, entries)) {
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+    SetFileAttributesW(zipPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+    if (!MoveFileExW(tempPath.c_str(), zipPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+    return true;
+}
+
 static bool CreateCrashReportZip(const std::wstring& runtimeRoot, const std::wstring& reason) {
     const std::wstring currentLogs = LogsCurrentDir(runtimeRoot);
     const std::wstring previousLogs = LogsPreviousDir(runtimeRoot);
@@ -605,10 +755,12 @@ static std::wstring RuntimeSeedStamp(const std::wstring& packageDir) {
         L"jvm=" + FileStamp(packageDir + L"\\jre\\bin\\server\\jvm.dll") + L"\n" +
         L"javaBasePatch=" + FileStamp(packageDir + L"\\java-base-uwp-filesystem.jar") + L"\n" +
         L"zipfsPatch=" + FileStamp(packageDir + L"\\java-zipfs-realpath.jar") + L"\n" +
+        L"javaDesktopPatch=" + FileStamp(packageDir + L"\\java-desktop-uwp-awt.jar") + L"\n" +
         L"jre21Release=" + FileStamp(packageDir + L"\\jre21\\release") + L"\n" +
         L"jvm21=" + FileStamp(packageDir + L"\\jre21\\bin\\server\\jvm.dll") + L"\n" +
         L"javaBasePatch21=" + FileStamp(packageDir + L"\\java-base-uwp-filesystem-21.jar") + L"\n" +
         L"zipfsPatch21=" + FileStamp(packageDir + L"\\java-zipfs-realpath-21.jar") + L"\n" +
+        L"javaDesktopPatch21=" + FileStamp(packageDir + L"\\java-desktop-uwp-awt-21.jar") + L"\n" +
         L"secureJarHandlerPatch=" + FileStamp(packageDir + L"\\securejarhandler-uwp-patch.jar") + L"\n" +
         L"patchedFabricLoader=" + FileStamp(packageDir + L"\\runtime\\libraries\\net\\fabricmc\\fabric-loader\\" + a2w(kFabricLoaderVersion) + L"\\fabric-loader-" + a2w(kFabricLoaderVersion) + L".jar") + L"\n" +
         L"bundledMods=" + FileStamp(packageDir + L"\\runtime\\bundled-mods") + L"\n" +
@@ -642,6 +794,8 @@ static bool IsLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std:
         GetFileAttributesW((localDir + L"\\java-base-uwp-filesystem.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool hasJavaZipfsPatch =
         GetFileAttributesW((localDir + L"\\java-zipfs-realpath.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool hasJavaDesktopPatch =
+        GetFileAttributesW((localDir + L"\\java-desktop-uwp-awt.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool packageHasJre21 =
         GetFileAttributesW((packageDir + L"\\jre21\\bin\\server\\jvm.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool hasJre21 = !packageHasJre21 ||
@@ -651,11 +805,13 @@ static bool IsLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std:
         GetFileAttributesW((localDir + L"\\java-base-uwp-filesystem-21.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool hasJavaZipfsPatch21 = !packageHasJre21 ||
         GetFileAttributesW((localDir + L"\\java-zipfs-realpath-21.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool hasJavaDesktopPatch21 = !packageHasJre21 ||
+        GetFileAttributesW((localDir + L"\\java-desktop-uwp-awt-21.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool packageHasSecureJarHandlerPatch =
         GetFileAttributesW((packageDir + L"\\securejarhandler-uwp-patch.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool hasSecureJarHandlerPatch = !packageHasSecureJarHandlerPatch ||
         GetFileAttributesW((localDir + L"\\securejarhandler-uwp-patch.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
-    return hasGameSupport && hasNatives && hasGraphics && hasJre && hasJavaBasePatch && hasJavaZipfsPatch && hasJre21 && hasJavaBasePatch21 && hasJavaZipfsPatch21 && hasSecureJarHandlerPatch;
+    return hasGameSupport && hasNatives && hasGraphics && hasJre && hasJavaBasePatch && hasJavaZipfsPatch && hasJavaDesktopPatch && hasJre21 && hasJavaBasePatch21 && hasJavaZipfsPatch21 && hasJavaDesktopPatch21 && hasSecureJarHandlerPatch;
 }
 
 static void MarkLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std::wstring& localDir) {
@@ -781,6 +937,8 @@ static bool SeedLocalRuntime(
     CopyFileIfNeeded(packageDir + L"\\java-base-uwp-filesystem-21.jar", localDir + L"\\java-base-uwp-filesystem-21.jar");
     CopyFileIfNeeded(packageDir + L"\\java-zipfs-realpath.jar", localDir + L"\\java-zipfs-realpath.jar");
     CopyFileIfNeeded(packageDir + L"\\java-zipfs-realpath-21.jar", localDir + L"\\java-zipfs-realpath-21.jar");
+    CopyFileIfNeeded(packageDir + L"\\java-desktop-uwp-awt.jar", localDir + L"\\java-desktop-uwp-awt.jar");
+    CopyFileIfNeeded(packageDir + L"\\java-desktop-uwp-awt-21.jar", localDir + L"\\java-desktop-uwp-awt-21.jar");
     CopyFileIfNeeded(packageDir + L"\\securejarhandler-uwp-patch.jar", localDir + L"\\securejarhandler-uwp-patch.jar");
     if (progress) {
         progress(L"Runtime ready", L"Starting Minecraft", 1.0f);
@@ -1479,6 +1637,33 @@ static bool MovePathIfExists(const std::wstring& source, const std::wstring& des
     EnsureDirectoryTree(GetParentDir(dest));
     const DWORD flags = replaceExisting ? MOVEFILE_REPLACE_EXISTING : 0;
     return MoveFileExW(source.c_str(), dest.c_str(), flags) != FALSE;
+}
+
+static bool CopyDirectoryTree(const std::wstring& source, const std::wstring& dest) {
+    if (source.empty() || dest.empty()) return false;
+    const DWORD attrs = GetFileAttributesW(source.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) return false;
+
+    EnsureDirectoryTree(dest);
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW((source + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return true;
+
+    bool ok = true;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        const std::wstring childSource = source + L"\\" + fd.cFileName;
+        const std::wstring childDest = dest + L"\\" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            ok = CopyDirectoryTree(childSource, childDest) && ok;
+        } else {
+            EnsureDirectoryTree(GetParentDir(childDest));
+            SetFileAttributesW(childDest.c_str(), FILE_ATTRIBUTE_NORMAL);
+            ok = CopyFileW(childSource.c_str(), childDest.c_str(), FALSE) != FALSE && ok;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return ok;
 }
 
 static void ArchiveCurrentLogsToPrevious(const std::wstring& runtimeRoot) {
@@ -2509,6 +2694,105 @@ static bool ReadModMeta(const std::wstring& runtimeRoot, const std::wstring& fil
     return any;
 }
 
+struct ProfileModInstallMeta {
+    std::wstring projectId;
+    std::wstring title;
+    bool dependency = false;
+    std::set<std::wstring> requiredBy;
+};
+
+static std::wstring ProfileModInstallMetaDirFromModsDir(const std::wstring& userModsDir) {
+    return GetParentDir(userModsDir) + L"\\.bandit\\mod-installs";
+}
+
+static std::wstring ProfileModInstallMetaPathFromModsDir(const std::wstring& userModsDir, const std::wstring& fileName) {
+    return ProfileModInstallMetaDirFromModsDir(userModsDir) + L"\\" + SafeFileName(fileName) + L".meta";
+}
+
+static std::set<std::wstring> SplitCommaSet(const std::wstring& value) {
+    std::set<std::wstring> out;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t comma = value.find(L',', start);
+        std::wstring part = value.substr(start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+        if (!part.empty()) out.insert(part);
+        if (comma == std::wstring::npos) break;
+        start = comma + 1;
+    }
+    return out;
+}
+
+static std::wstring JoinCommaSet(const std::set<std::wstring>& values) {
+    std::wstring out;
+    for (const std::wstring& value : values) {
+        if (!out.empty()) out += L",";
+        out += value;
+    }
+    return out;
+}
+
+static bool ReadProfileModInstallMetaFromModsDir(
+    const std::wstring& userModsDir,
+    const std::wstring& fileName,
+    ProfileModInstallMeta& meta) {
+    std::wstring body;
+    if (!ReadTextFile(ProfileModInstallMetaPathFromModsDir(userModsDir, fileName), body)) return false;
+
+    meta = {};
+    std::wstringstream ss(body);
+    std::wstring line;
+    bool any = false;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        const size_t tab = line.find(L'\t');
+        if (tab == std::wstring::npos) continue;
+        const std::wstring key = line.substr(0, tab);
+        const std::wstring value = line.substr(tab + 1);
+        if (key == L"projectId") { meta.projectId = value; any = true; }
+        else if (key == L"title") { meta.title = value; any = true; }
+        else if (key == L"dependency") { meta.dependency = value == L"1"; any = true; }
+        else if (key == L"requiredBy") { meta.requiredBy = SplitCommaSet(value); any = true; }
+    }
+    return any;
+}
+
+static void WriteProfileModInstallMetaFromModsDir(
+    const std::wstring& userModsDir,
+    const std::wstring& fileName,
+    const ProfileModInstallMeta& meta) {
+    const std::wstring body =
+        L"projectId\t" + StripNewlines(meta.projectId) + L"\n" +
+        L"title\t" + StripNewlines(meta.title) + L"\n" +
+        L"dependency\t" + std::wstring(meta.dependency ? L"1" : L"0") + L"\n" +
+        L"requiredBy\t" + JoinCommaSet(meta.requiredBy) + L"\n";
+    WriteTextFile(ProfileModInstallMetaPathFromModsDir(userModsDir, fileName), body);
+}
+
+static void RecordProfileModInstall(
+    const std::wstring& userModsDir,
+    const std::wstring& fileName,
+    const std::wstring& projectId,
+    const std::wstring& title,
+    bool dependency,
+    const std::wstring& requiredBy) {
+    ProfileModInstallMeta meta;
+    ReadProfileModInstallMetaFromModsDir(userModsDir, fileName, meta);
+    const bool hadExistingMeta = !meta.projectId.empty() || !meta.title.empty() || meta.dependency || !meta.requiredBy.empty();
+    if (!projectId.empty()) meta.projectId = projectId;
+    if (!title.empty()) meta.title = title;
+    if (!dependency) {
+        meta.dependency = false;
+        meta.requiredBy.clear();
+    } else if (meta.dependency) {
+        if (!requiredBy.empty()) meta.requiredBy.insert(requiredBy);
+    } else if (!hadExistingMeta) {
+        meta.dependency = true;
+        if (!requiredBy.empty()) meta.requiredBy.insert(requiredBy);
+    }
+    if (meta.projectId.empty()) meta.projectId = projectId;
+    WriteProfileModInstallMetaFromModsDir(userModsDir, fileName, meta);
+}
+
 static bool ResolveInstalledModMeta(const std::wstring& runtimeRoot, const std::wstring& jarPath, ModCard& card) {
     using namespace winrt::Windows::Data::Json;
     std::string sha1;
@@ -2726,8 +3010,8 @@ struct BlockedMod {
     const wchar_t* reason;
 };
 
-// Mods known to break this UWP runtime. Matching is intentionally by filename
-// substring because modpack file names vary by loader, version, and source.
+// Mods known to break this UWP runtime. Match on filename token boundaries so
+// blocked mods do not also remove dependency libraries with similar names.
 static const BlockedMod kBlockedMods[] = {
     { L"essential", L"Essential injects a launch transformer that crashes in the embedded/UWP runtime" },
     { L"crashassistant", L"Crash Assistant starts an external helper and hangs before GLFW startup" },
@@ -2744,10 +3028,27 @@ static const BlockedMod kBlockedMods[] = {
     { L"midnight-controls", L"MidnightControls conflicts with the bundled Bandit controller compatibility layer" },
 };
 
+static bool IsAsciiNameChar(wchar_t ch) {
+    return (ch >= L'a' && ch <= L'z') ||
+           (ch >= L'0' && ch <= L'9');
+}
+
+static bool FilenameHasBlockedToken(const std::wstring& lower, const std::wstring& token) {
+    size_t pos = lower.find(token);
+    while (pos != std::wstring::npos) {
+        const size_t end = pos + token.size();
+        const bool leftOk = pos == 0 || !IsAsciiNameChar(lower[pos - 1]);
+        const bool rightOk = end >= lower.size() || !IsAsciiNameChar(lower[end]);
+        if (leftOk && rightOk) return true;
+        pos = lower.find(token, pos + 1);
+    }
+    return false;
+}
+
 static const BlockedMod* FindBlockedModFile(const std::wstring& fileName) {
     const std::wstring lower = ToLowerW(fileName);
     for (const BlockedMod& b : kBlockedMods) {
-        if (lower.find(b.token) != std::wstring::npos) return &b;
+        if (FilenameHasBlockedToken(lower, b.token)) return &b;
     }
     return nullptr;
 }
@@ -2999,6 +3300,78 @@ static bool FindModJarByFabricIdOrName(
         jarPath = fallback;
         return true;
     }
+    return false;
+}
+
+static bool JsonArrayRemoveString(winrt::Windows::Data::Json::JsonObject& root, const wchar_t* key, const std::wstring& item) {
+    using namespace winrt::Windows::Data::Json;
+    if (!root.HasKey(key) || root.GetNamedValue(key).ValueType() != JsonValueType::Array) return false;
+
+    JsonArray oldArray = root.GetNamedArray(key);
+    JsonArray newArray;
+    bool changed = false;
+    for (uint32_t i = 0; i < oldArray.Size(); ++i) {
+        IJsonValue value = oldArray.GetAt(i);
+        if (value.ValueType() == JsonValueType::String && std::wstring(value.GetString().c_str()) == item) {
+            changed = true;
+            continue;
+        }
+        newArray.Append(value);
+    }
+    if (changed) root.SetNamedValue(key, newArray);
+    return changed;
+}
+
+static bool PatchMoonlightPoiMixin(const std::wstring& gameDir, const std::wstring& userModsDir, const std::wstring& minecraftVersion) {
+    if (CompareVersionNumbers(w2a(minecraftVersion), "1.21.1") != 0) return false;
+
+    std::wstring moonlightJar;
+    if (!FindModJarByFabricIdOrName(userModsDir, L"moonlight", L"moonlight", moonlightJar)) {
+        WriteLogF(L"Moonlight PoiMixin patch skipped; Moonlight jar not found in %s", userModsDir.c_str());
+        return false;
+    }
+
+    const char* mixinEntry = "moonlight-common.mixins.json";
+    std::wstring mixinText;
+    if (!ReadZipTextFile(moonlightJar, mixinEntry, mixinText)) {
+        WriteLogF(L"Moonlight PoiMixin patch skipped; %s not found in %s", a2w(mixinEntry).c_str(), moonlightJar.c_str());
+        return false;
+    }
+    if (mixinText.find(L"PoiMixin") == std::wstring::npos) {
+        WriteLogF(L"Moonlight PoiMixin patch skipped; PoiMixin already absent in %s", moonlightJar.c_str());
+        return false;
+    }
+
+    using namespace winrt::Windows::Data::Json;
+    JsonObject root;
+    try {
+        root = JsonObject::Parse(winrt::hstring(mixinText.c_str()));
+    } catch (...) {
+        WriteLogF(L"Moonlight mixin patch skipped; could not parse %s in %s", a2w(mixinEntry).c_str(), moonlightJar.c_str());
+        return false;
+    }
+
+    bool changed = false;
+    changed |= JsonArrayRemoveString(root, L"mixins", L"PoiMixin");
+    changed |= JsonArrayRemoveString(root, L"client", L"PoiMixin");
+    changed |= JsonArrayRemoveString(root, L"server", L"PoiMixin");
+    if (!changed) return false;
+
+    const std::wstring overridePath = gameDir + L"\\launcher-overrides\\" + a2w(mixinEntry);
+    if (WriteTextFile(overridePath, std::wstring(root.Stringify().c_str()))) {
+        WriteLogF(L"Moonlight PoiMixin patched via launcher override: %s source=%s", overridePath.c_str(), moonlightJar.c_str());
+        return true;
+    }
+
+    WriteLogF(L"Moonlight PoiMixin launcher override write failed: %s err=%u", overridePath.c_str(), GetLastError());
+
+    const std::wstring backupPath = gameDir + L"\\.bandit\\mod-originals\\" + GetFileName(moonlightJar);
+    if (RewriteZipTextEntry(moonlightJar, mixinEntry, std::wstring(root.Stringify().c_str()), backupPath)) {
+        WriteLogF(L"Patched Moonlight PoiMixin for NeoForge 1.21.1: %s backup=%s", moonlightJar.c_str(), backupPath.c_str());
+        return true;
+    }
+
+    WriteLogF(L"Moonlight PoiMixin patch failed: %s", moonlightJar.c_str());
     return false;
 }
 
@@ -3504,8 +3877,72 @@ static bool ConfigureMidnightControlsDefaults(const std::wstring& gameDir, const
     return true;
 }
 
+static bool ConfigureDistantHorizonsDefaults(const std::wstring& gameDir, const std::wstring& userModsDir) {
+    std::wstring distantHorizonsJar;
+    if (!FindModJarByFabricIdOrName(userModsDir, L"distanthorizons", L"distanthorizons", distantHorizonsJar)) {
+        return false;
+    }
+
+    const std::wstring configDir = gameDir + L"\\config";
+    EnsureDirectoryTree(configDir);
+
+    const std::wstring configPath = configDir + L"\\DistantHorizons.toml";
+    std::wstring configText;
+    if (!ReadTextFile(configPath, configText)) {
+        configText =
+            L"_version = 4\n"
+            L"\n"
+            L"[server]\n"
+            L"maxSyncOnLoadRequestDistance = 512\n"
+            L"maxGenerationRequestDistance = 512\n"
+            L"enableServerGeneration = false\n"
+            L"\n"
+            L"[common.multiThreading]\n"
+            L"numberOfThreads = 2\n"
+            L"threadRunTimeRatio = \"0.35\"\n"
+            L"\n"
+            L"[client.advanced]\n"
+            L"enableDistantGeneration = false\n"
+            L"\n"
+            L"[client.advanced.autoUpdater]\n"
+            L"enableAutoUpdater = false\n"
+            L"enableSilentUpdates = false\n"
+            L"\n"
+            L"[client.advanced.graphics.quality]\n"
+            L"verticalQuality = \"LOW\"\n"
+            L"lodChunkRenderDistanceRadius = 64\n"
+            L"horizontalQuality = \"LOW\"\n";
+    }
+
+    bool changed = false;
+    changed |= UpsertTomlSectionSetting(configText, L"client.advanced.autoUpdater", L"enableAutoUpdater", L"false", false);
+    changed |= UpsertTomlSectionSetting(configText, L"client.advanced.autoUpdater", L"enableSilentUpdates", L"false", false);
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"client.advanced", L"enableDistantGeneration", L"false", { L"true" });
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"server", L"enableServerGeneration", L"false", { L"true" });
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"server", L"maxGenerationRequestDistance", L"512", { L"4096" });
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"server", L"maxSyncOnLoadRequestDistance", L"512", { L"4096" });
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"common.multiThreading", L"numberOfThreads", L"2", { L"16", L"8", L"4" });
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"common.multiThreading", L"threadRunTimeRatio", L"\"0.35\"", { L"\"1.0\"", L"\"1\"", L"1.0", L"1" });
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"client.advanced.graphics.quality", L"verticalQuality", L"\"LOW\"", { L"\"MEDIUM\"", L"\"HIGH\"", L"\"EXTREME\"" });
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"client.advanced.graphics.quality", L"horizontalQuality", L"\"LOW\"", { L"\"MEDIUM\"", L"\"HIGH\"", L"\"EXTREME\"" });
+    changed |= UpsertTomlSectionSettingWhenMissingOrValues(configText, L"client.advanced.graphics.quality", L"lodChunkRenderDistanceRadius", L"64", { L"128", L"256", L"512", L"1024" });
+
+    if (changed) {
+        if (WriteTextFile(configPath, configText)) {
+            WriteLogF(L"Distant Horizons config seeded for Xbox startup stability: %s", configPath.c_str());
+        } else {
+            WriteLogF(L"Failed to write Distant Horizons config: %s err=%u", configPath.c_str(), GetLastError());
+        }
+    } else {
+        WriteLog(L"Distant Horizons config already has Xbox-safe startup settings; leaving it unchanged");
+    }
+    return true;
+}
+
 static void ConfigureKnownModDefaults(const std::wstring& gameDir, const std::wstring& userModsDir, const std::wstring& minecraftVersion) {
+    PatchMoonlightPoiMixin(gameDir, userModsDir, minecraftVersion);
     ConfigureSodiumDefaults(gameDir, userModsDir, minecraftVersion);
+    ConfigureDistantHorizonsDefaults(gameDir, userModsDir);
     const bool hasLambdaControls = ConfigureLambdaControlsDefaults(gameDir, userModsDir);
     const bool hasMidnightControls = ConfigureMidnightControlsDefaults(gameDir, userModsDir);
     const bool legacyControllerMod = hasLambdaControls || hasMidnightControls;
@@ -3545,7 +3982,9 @@ static bool InstallModrinthProjectRecursive(
     std::wstring& error,
     const std::string& gameVersion,
     const std::string& loaderId,
-    const std::string& loaderVersion) {
+    const std::string& loaderVersion,
+    const std::wstring& rootProjectId,
+    bool installingDependency) {
     using namespace winrt::Windows::Data::Json;
     if (projectIdOrSlug.empty()) {
         error = L"Missing Modrinth project id";
@@ -3620,10 +4059,18 @@ static bool InstallModrinthProjectRecursive(
             }
 
             const std::wstring destination = userModsDir + L"\\" + SafeFileName(filename);
+            const std::wstring installedFileName = SafeFileName(filename);
+            const std::wstring actualProjectId = JsonStringOrEmpty(version, L"project_id").empty()
+                ? projectIdOrSlug
+                : JsonStringOrEmpty(version, L"project_id");
+
             if (FileMatchesSha1(destination, sha1)) {
                 std::wstring reason;
                 if (ModJarMatchesFabricLoader(destination, loaderVersion, reason)) {
                     WriteLogF(L"Mod already installed: %s", destination.c_str());
+                    RecordProfileModInstall(userModsDir, installedFileName, actualProjectId,
+                        topMeta ? topMeta->title : projectIdOrSlug,
+                        installingDependency, rootProjectId);
                     return true;
                 }
                 WriteLogF(L"Installed Modrinth file is not compatible with target loader: %s (%s)",
@@ -3659,7 +4106,7 @@ static bool InstallModrinthProjectRecursive(
                 ToLowerW(projectIdOrSlug) != L"p7dr8msh" &&
                 FabricModDependsOn(tempPath, L"fabric")) {
                 WriteLogF(L"Mod %s requires Fabric API; ensuring Fabric API dependency", filename.c_str());
-                if (!InstallModrinthProjectRecursive(L"P7dR8mSH", runtimeRoot, userModsDir, visited, installed, nullptr, error, gameVersion, loaderId, loaderVersion)) {
+                if (!InstallModrinthProjectRecursive(L"P7dR8mSH", runtimeRoot, userModsDir, visited, installed, nullptr, error, gameVersion, loaderId, loaderVersion, rootProjectId, true)) {
                     DeleteFileW(tempPath.c_str());
                     return false;
                 }
@@ -3675,7 +4122,7 @@ static bool InstallModrinthProjectRecursive(
                     if (JsonStringOrEmpty(dep, L"dependency_type") != L"required") continue;
                     const std::wstring depProject = JsonStringOrEmpty(dep, L"project_id");
                     if (!depProject.empty() &&
-                        !InstallModrinthProjectRecursive(depProject, runtimeRoot, userModsDir, visited, installed, nullptr, error, gameVersion, loaderId, loaderVersion)) {
+                        !InstallModrinthProjectRecursive(depProject, runtimeRoot, userModsDir, visited, installed, nullptr, error, gameVersion, loaderId, loaderVersion, rootProjectId, true)) {
                         DeleteFileW(tempPath.c_str());
                         return false;
                     }
@@ -3690,11 +4137,14 @@ static bool InstallModrinthProjectRecursive(
                 return false;
             }
 
-            installed.push_back(filename);
+            installed.push_back(installedFileName);
             if (topMeta) {
                 ModCard meta = *topMeta;
-                WriteModMeta(runtimeRoot, filename, meta);
+                WriteModMeta(runtimeRoot, installedFileName, meta);
             }
+            RecordProfileModInstall(userModsDir, installedFileName, actualProjectId,
+                topMeta ? topMeta->title : projectIdOrSlug,
+                installingDependency, rootProjectId);
             WriteLogF(L"Installed Modrinth mod %s", destination.c_str());
             return true;
         }
@@ -3722,7 +4172,7 @@ static bool InstallModrinthProject(
     const std::string& loaderVersion) {
     std::set<std::wstring> visited;
     const std::wstring id = !card.projectId.empty() ? card.projectId : card.slug;
-    return InstallModrinthProjectRecursive(id, runtimeRoot, userModsDir, visited, installed, &card, error, gameVersion, loaderId, loaderVersion);
+    return InstallModrinthProjectRecursive(id, runtimeRoot, userModsDir, visited, installed, &card, error, gameVersion, loaderId, loaderVersion, id, false);
 }
 
 static bool WriteAllBytes(const std::wstring& path, const void* data, size_t size) {
@@ -4543,6 +4993,17 @@ static std::vector<std::wstring> SplitManifestValueList(const std::wstring& valu
     return out;
 }
 
+static bool IsJvmMemoryOption(const std::wstring& arg) {
+    const std::wstring trimmed = TrimWhitespace(arg);
+    if (trimmed.empty()) return false;
+    const std::wstring lower = ToLowerW(trimmed);
+    return lower.rfind(L"-xmx", 0) == 0 ||
+        lower.rfind(L"-xms", 0) == 0 ||
+        lower.rfind(L"-xx:maxram", 0) == 0 ||
+        lower.rfind(L"-xx:initialram", 0) == 0 ||
+        lower.rfind(L"-xx:heap", 0) == 0;
+}
+
 static void ReadManifestHeader(
     const std::wstring& manifestPath,
     std::wstring& assetIndex,
@@ -4839,9 +5300,168 @@ static std::wstring CreateAutoProfile(const std::wstring& runtimeRoot, const Lau
     return CreateProfile(runtimeRoot, L"Profile " + std::to_wstring(n) + L" - " + TargetShortText(target), target);
 }
 
-static void DeleteProfile(const std::wstring& runtimeRoot, const std::wstring& id) {
+static std::wstring ProfileBackupsRoot(const std::wstring& runtimeRoot) {
+    return runtimeRoot + L"\\profile-backups";
+}
+
+static std::wstring ProfileBackupDir(const std::wstring& runtimeRoot, const std::wstring& kind, const std::wstring& profileId) {
+    return ProfileBackupsRoot(runtimeRoot) + L"\\" + kind + L"-" + CrashTimestampForFileName() + L"-" + SafeFileName(profileId);
+}
+
+static void WriteProfileBackupMeta(const std::wstring& backupDir, const Profile& profile, const std::wstring& kind) {
+    using namespace winrt::Windows::Data::Json;
+    auto jsonString = [](const std::wstring& value) {
+        return JsonValue::CreateStringValue(winrt::hstring(value.c_str()));
+    };
+
+    JsonObject obj;
+    obj.SetNamedValue(L"schemaVersion", JsonValue::CreateNumberValue(1));
+    obj.SetNamedValue(L"kind", jsonString(kind));
+    obj.SetNamedValue(L"id", jsonString(profile.id));
+    obj.SetNamedValue(L"name", jsonString(profile.name));
+    obj.SetNamedValue(L"minecraftVersion", jsonString(profile.minecraftVersion));
+    obj.SetNamedValue(L"loader", jsonString(profile.loader));
+    obj.SetNamedValue(L"loaderVersion", jsonString(profile.loaderVersion));
+    obj.SetNamedValue(L"targetId", jsonString(profile.targetId));
+    obj.SetNamedValue(L"created", jsonString(CrashTimestampForFileName()));
+    WriteTextFile(backupDir + L"\\profile_backup.json", std::wstring(obj.Stringify().c_str()));
+}
+
+static bool ReadProfileBackupMeta(const std::wstring& backupDir, Profile& profile, std::wstring& kind) {
+    using namespace winrt::Windows::Data::Json;
+    std::wstring body;
+    if (!ReadTextFile(backupDir + L"\\profile_backup.json", body)) return false;
+    try {
+        JsonObject obj = JsonObject::Parse(winrt::hstring(body.c_str()));
+        kind = JsonStringOrEmpty(obj, L"kind");
+        profile.id = JsonStringOrEmpty(obj, L"id");
+        profile.name = JsonStringOrEmpty(obj, L"name");
+        profile.minecraftVersion = JsonStringOrEmpty(obj, L"minecraftVersion");
+        profile.loader = ToLowerW(JsonStringOrEmpty(obj, L"loader"));
+        profile.loaderVersion = JsonStringOrEmpty(obj, L"loaderVersion");
+        profile.targetId = JsonStringOrEmpty(obj, L"targetId");
+        profile.builtin = false;
+        if (profile.id.empty()) return false;
+        if (profile.name.empty()) profile.name = profile.id;
+        const LaunchTarget def = DefaultLaunchTarget();
+        if (profile.minecraftVersion.empty()) profile.minecraftVersion = def.minecraftVersion;
+        if (profile.loader.empty()) profile.loader = def.loader;
+        if (profile.loaderVersion.empty()) profile.loaderVersion = def.loaderVersion;
+        if (profile.targetId.empty()) profile.targetId = MakeTargetId(profile.minecraftVersion, profile.loader, profile.loaderVersion);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static std::wstring LatestProfileBackup(const std::wstring& runtimeRoot, const std::wstring& kind) {
+    const std::wstring root = ProfileBackupsRoot(runtimeRoot);
+    std::wstring latest;
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW((root + L"\\" + kind + L"-*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            const std::wstring name = fd.cFileName;
+            if (latest.empty() || _wcsicmp(name.c_str(), latest.c_str()) > 0) latest = name;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return latest.empty() ? std::wstring() : root + L"\\" + latest;
+}
+
+static std::wstring ProfileBackupDisplayName(const std::wstring& backupDir) {
+    Profile p;
+    std::wstring kind;
+    if (ReadProfileBackupMeta(backupDir, p, kind)) return p.name;
+    const size_t slash = backupDir.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? backupDir : backupDir.substr(slash + 1);
+}
+
+static bool BackupProfile(const std::wstring& runtimeRoot, const std::wstring& id, std::wstring& backupDir) {
+    if (id.empty() || id == kVanillaProfileId) return false;
+    const Profile profile = GetProfileById(runtimeRoot, id);
+    backupDir = ProfileBackupDir(runtimeRoot, L"manual", id);
+    DeleteDirectoryTree(backupDir);
+    EnsureDirectoryTree(backupDir);
+    WriteProfileBackupMeta(backupDir, profile, L"manual");
+    return CopyDirectoryTree(ProfileDir(runtimeRoot, id), backupDir + L"\\profile");
+}
+
+static std::wstring UniqueRestoredProfileId(const std::wstring& runtimeRoot, const std::wstring& desiredId, const std::vector<Profile>& profiles) {
+    std::wstring base = SafeFileName(desiredId.empty() ? std::wstring(L"profile") : desiredId);
+    if (base == kVanillaProfileId) base += L"-restored";
+    std::wstring id = base;
+    int n = 2;
+    auto existsInProfiles = [&](const std::wstring& probe) {
+        return std::find_if(profiles.begin(), profiles.end(), [&](const Profile& p) { return p.id == probe; }) != profiles.end();
+    };
+    while (existsInProfiles(id) || GetFileAttributesW(ProfileDir(runtimeRoot, id).c_str()) != INVALID_FILE_ATTRIBUTES) {
+        id = base + L"-restored-" + std::to_wstring(n++);
+    }
+    return id;
+}
+
+static bool RestoreProfileBackup(const std::wstring& runtimeRoot, const std::wstring& backupDir, bool removeBackup, std::wstring& restoredName) {
+    Profile profile;
+    std::wstring kind;
+    if (!ReadProfileBackupMeta(backupDir, profile, kind)) return false;
+
+    std::vector<Profile> profiles = LoadProfiles(runtimeRoot);
+    profile.id = UniqueRestoredProfileId(runtimeRoot, profile.id, profiles);
+    profile.builtin = false;
+
+    const std::wstring source = backupDir + L"\\profile";
+    const std::wstring dest = ProfileDir(runtimeRoot, profile.id);
+    DeleteDirectoryTree(dest);
+    bool copied = false;
+    if (removeBackup) {
+        EnsureDirectoryTree(GetParentDir(dest));
+        copied = MoveFileExW(source.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
+    }
+    if (!copied) {
+        copied = CopyDirectoryTree(source, dest);
+    }
+    if (!copied) return false;
+
+    profiles.push_back(profile);
+    SaveProfiles(runtimeRoot, profiles);
+    SetActiveProfileId(runtimeRoot, profile.id);
+    restoredName = profile.name;
+    if (removeBackup) DeleteDirectoryTree(backupDir);
+    return true;
+}
+
+static void DeleteProfilePermanent(const std::wstring& runtimeRoot, const std::wstring& id) {
     if (id.empty() || id == kVanillaProfileId) return;
     DeleteDirectoryTree(ProfileDir(runtimeRoot, id));
+    std::vector<Profile> kept;
+    for (const Profile& p : LoadProfiles(runtimeRoot)) if (p.id != id) kept.push_back(p);
+    SaveProfiles(runtimeRoot, kept);
+    if (GetActiveProfileId(runtimeRoot) == id) SetActiveProfileId(runtimeRoot, kVanillaProfileId);
+}
+
+static void DeleteProfile(const std::wstring& runtimeRoot, const std::wstring& id) {
+    if (id.empty() || id == kVanillaProfileId) return;
+    const Profile profile = GetProfileById(runtimeRoot, id);
+    const std::wstring backupDir = ProfileBackupDir(runtimeRoot, L"deleted", id);
+    DeleteDirectoryTree(backupDir);
+    EnsureDirectoryTree(backupDir);
+    WriteProfileBackupMeta(backupDir, profile, L"deleted");
+    const std::wstring backupProfileDir = backupDir + L"\\profile";
+    bool archived = MovePathIfExists(ProfileDir(runtimeRoot, id), backupProfileDir, true);
+    if (!archived) {
+        archived = CopyDirectoryTree(ProfileDir(runtimeRoot, id), backupProfileDir);
+    }
+    if (!archived) {
+        WriteLogF(L"Profile delete aborted because backup failed: %s", id.c_str());
+        DeleteDirectoryTree(backupDir);
+        return;
+    }
+    if (GetFileAttributesW(ProfileDir(runtimeRoot, id).c_str()) != INVALID_FILE_ATTRIBUTES) {
+        DeleteDirectoryTree(ProfileDir(runtimeRoot, id));
+    }
     std::vector<Profile> kept;
     for (const Profile& p : LoadProfiles(runtimeRoot)) if (p.id != id) kept.push_back(p);
     SaveProfiles(runtimeRoot, kept);
@@ -4971,6 +5591,45 @@ static std::vector<std::wstring> ListProfileMods(const std::wstring& runtimeRoot
     }
     std::sort(out.begin(), out.end());
     return out;
+}
+
+static int RemoveProfileModAndUnusedDependencies(const std::wstring& runtimeRoot, const std::wstring& profileId, const std::wstring& jarName) {
+    const std::wstring modsDir = ProfileModsDir(runtimeRoot, profileId);
+    ProfileModInstallMeta removedMeta;
+    const bool hasMeta = ReadProfileModInstallMetaFromModsDir(modsDir, jarName, removedMeta);
+
+    int removed = 0;
+    if (DeleteFileW((modsDir + L"\\" + jarName).c_str())) {
+        ++removed;
+    }
+    DeleteFileW(ModMetaPath(runtimeRoot, jarName).c_str());
+    DeleteFileW(ProfileModInstallMetaPathFromModsDir(modsDir, jarName).c_str());
+
+    if (!hasMeta || removedMeta.projectId.empty()) {
+        return removed;
+    }
+
+    const std::vector<std::wstring> remaining = ListProfileMods(runtimeRoot, profileId);
+    for (const std::wstring& candidate : remaining) {
+        ProfileModInstallMeta meta;
+        if (!ReadProfileModInstallMetaFromModsDir(modsDir, candidate, meta)) continue;
+        if (!meta.dependency) continue;
+        const size_t erased = meta.requiredBy.erase(removedMeta.projectId);
+        if (erased == 0) continue;
+
+        if (meta.requiredBy.empty()) {
+            if (DeleteFileW((modsDir + L"\\" + candidate).c_str())) {
+                ++removed;
+                WriteLogF(L"Removed unused dependency mod: %s", candidate.c_str());
+            }
+            DeleteFileW(ModMetaPath(runtimeRoot, candidate).c_str());
+            DeleteFileW(ProfileModInstallMetaPathFromModsDir(modsDir, candidate).c_str());
+        } else {
+            WriteProfileModInstallMetaFromModsDir(modsDir, candidate, meta);
+        }
+    }
+
+    return removed;
 }
 
 static std::wstring ProfileDisplayName(const std::wstring& runtimeRoot, const std::wstring& id) {
@@ -5893,7 +6552,7 @@ static void StartInstallJob(const ModCard& card, const std::wstring& runtimeRoot
                 SetActiveProfileId(rootCopy, pid);
                 SetInstallStatus(L"Installed profile " + copy.title);
             } else {
-                DeleteProfile(rootCopy, pid);
+                DeleteProfilePermanent(rootCopy, pid);
                 SetInstallStatus(err.empty() ? L"Modpack install failed" : err);
             }
         } else {
@@ -6050,6 +6709,8 @@ struct AuthUiState {
     float animation = 0.0f;
     float progress = -1.0f;
     QrMatrix qr;
+    bool showLaunchLog = false;
+    std::wstring launchLogText;
 };
 
 static LaunchTarget CurrentModsTarget(const AuthUiState& state);
@@ -6387,7 +7048,16 @@ public:
                     D2D1::RectF(playBtn.left + 50.0f, playBtn.top, playBtn.right - 8.0f, playBtn.bottom), isActive ? muted.Get() : black.Get());
 
                 if (!state.modsProfileBuiltin) {
-                    const D2D1_RECT_F delBtn = D2D1::RectF(right - btnW * 2.0f - 16.0f, top, right - btnW - 16.0f, top + btnH);
+                    const D2D1_RECT_F backupBtn = D2D1::RectF(right - btnW * 2.0f - 16.0f, top, right - btnW - 16.0f, top + btnH);
+                    const bool backupFocus = state.modsProfileFocus == 3;
+                    if (backupFocus) GlowSelect(backupBtn, 12.0f);
+                    FillRound(backupBtn, surfaceFill.Get(), 12.0f);
+                    StrokeRound(backupBtn, accent.Get(), 12.0f, backupFocus ? 3.0f : 2.0f);
+                    DrawIcon(L"\uE74E", D2D1::RectF(backupBtn.left + 16.0f, backupBtn.top, backupBtn.left + 44.0f, backupBtn.bottom), accent.Get());
+                    DrawText(L"Backup", bodyMid_.Get(),
+                        D2D1::RectF(backupBtn.left + 50.0f, backupBtn.top, backupBtn.right - 8.0f, backupBtn.bottom), accent.Get());
+
+                    const D2D1_RECT_F delBtn = D2D1::RectF(right - btnW * 3.0f - 32.0f, top, right - btnW * 2.0f - 32.0f, top + btnH);
                     const bool delFocus = state.modsProfileFocus == 1;
                     if (delFocus) GlowSelect(delBtn, 12.0f);
                     FillRound(delBtn, surfaceFill.Get(), 12.0f);
@@ -6403,7 +7073,7 @@ public:
                             : (state.modsProfileBuiltin
                                 ? L"B  Back"
                                 : (gridFocus ? L"B  Back      X  Remove mod      Y  Rename"
-                                             : L"B  Back      Down to mods      Y  Rename")),
+                                             : L"B  Back      A select      X Delete      Y Rename")),
                     smallFormat_.Get(),
                     D2D1::RectF(left, top + btnH + 12.0f, right, top + btnH + 40.0f),
                     state.modsRenaming ? accent.Get() : muted.Get());
@@ -6749,6 +7419,22 @@ public:
             if (!state.detail.empty()) {
                 const D2D1_RECT_F detailRect = D2D1::RectF(left, frame.top + 248.0f, right, frame.top + 306.0f);
                 DrawText(state.detail.c_str(), smallFormat_.Get(), detailRect, muted.Get());
+            }
+
+            if (state.showLaunchLog) {
+                const float logTop = frame.top + 326.0f;
+                const float logBottom = frame.bottom - 158.0f;
+                const D2D1_RECT_F logBox = D2D1::RectF(left, logTop, right, logBottom);
+                FillRound(logBox, surfaceFill.Get(), 14.0f);
+                StrokeRound(logBox, softEdge.Get(), 14.0f, 1.0f);
+                DrawText(L"Live launch log", captionFormat_.Get(),
+                    D2D1::RectF(logBox.left + 18.0f, logBox.top + 12.0f, logBox.right - 18.0f, logBox.top + 40.0f),
+                    accent.Get());
+                const D2D1_RECT_F logTextRect = D2D1::RectF(logBox.left + 18.0f, logBox.top + 46.0f, logBox.right - 18.0f, logBox.bottom - 16.0f);
+                d2dContext_->PushAxisAlignedClip(logTextRect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                DrawText(state.launchLogText.empty() ? L"Waiting for pre-launch log output..." : state.launchLogText.c_str(),
+                    smallFormat_.Get(), logTextRect, muted.Get());
+                d2dContext_->PopAxisAlignedClip();
             }
 
             if (state.progress >= 0.0f) {
@@ -7460,6 +8146,24 @@ static void LoadModsTab(AuthUiState& state, const std::wstring& runtimeRoot, con
     if (state.selectedModsTab == 0) {
         EnsureProfilesInitialized(runtimeRoot);
         const std::wstring active = GetActiveProfileId(runtimeRoot);
+        const std::wstring deletedBackup = LatestProfileBackup(runtimeRoot, L"deleted");
+        if (!deletedBackup.empty()) {
+            ModCard undo;
+            undo.projectId = L"__restore_deleted__";
+            undo.title = L"Undo deleted profile";
+            undo.description = ProfileBackupDisplayName(deletedBackup) + L" - restore the last deleted profile";
+            undo.status = L"A restore";
+            state.modsCards.push_back(undo);
+        }
+        const std::wstring manualBackup = LatestProfileBackup(runtimeRoot, L"manual");
+        if (!manualBackup.empty()) {
+            ModCard restore;
+            restore.projectId = L"__restore_backup__";
+            restore.title = L"Restore profile backup";
+            restore.description = ProfileBackupDisplayName(manualBackup) + L" - restore the latest manual backup";
+            restore.status = L"A restore copy";
+            state.modsCards.push_back(restore);
+        }
         {
             ModCard add;
             add.projectId = L"__new__";
@@ -7485,7 +8189,7 @@ static void LoadModsTab(AuthUiState& state, const std::wstring& runtimeRoot, con
             c.status = isActive ? L"\u25CF Playing this" : L"";
             state.modsCards.push_back(c);
         }
-        state.status = L"A open profile  -  X delete  -  installs go to the active profile";
+        state.status = L"A open or restore  -  X delete profile  -  installs go to the active profile";
         return;
     }
 
@@ -8051,9 +8755,19 @@ static void ShowModsPage(
                 state.modsRenaming = true;
                 ModsSearchBeginInput();
             } else if (!gridFocus && leftDown && !leftWasDown) {
-                if (!state.modsProfileBuiltin) state.modsProfileFocus = 1;
+                if (!state.modsProfileBuiltin) {
+                    if (state.modsProfileFocus == 0) state.modsProfileFocus = 3;
+                    else if (state.modsProfileFocus == 3) state.modsProfileFocus = 1;
+                    else state.modsProfileFocus = 1;
+                }
             } else if (!gridFocus && rightDown && !rightWasDown) {
-                state.modsProfileFocus = 0;
+                if (!state.modsProfileBuiltin) {
+                    if (state.modsProfileFocus == 1) state.modsProfileFocus = 3;
+                    else if (state.modsProfileFocus == 3) state.modsProfileFocus = 0;
+                    else state.modsProfileFocus = 0;
+                } else {
+                    state.modsProfileFocus = 0;
+                }
             } else if (!gridFocus && (downDown && !downWasDown)) {
                 if (pmTotal > 0) { state.modsProfileFocus = 2; state.modsProfileSel = 0; state.modsProfileScroll = 0; }
             } else if (gridFocus && (upDown && !upWasDown)) {
@@ -8072,19 +8786,21 @@ static void ShowModsPage(
             } else if (xDown && !xWasDown) {
                 if (gridFocus && pmTotal > 0 && state.modsProfileSel < pmTotal) {
                     const std::wstring jar = state.modsProfileMods[static_cast<size_t>(state.modsProfileSel)];
-                    DeleteFileW((ProfileModsDir(runtimeRoot, state.modsProfileId) + L"\\" + jar).c_str());
+                    const int removed = RemoveProfileModAndUnusedDependencies(runtimeRoot, state.modsProfileId, jar);
                     state.modsProfileMods = ListProfileMods(runtimeRoot, state.modsProfileId);
                     const int newTotal = static_cast<int>(state.modsProfileMods.size());
                     if (state.modsProfileSel >= newTotal) state.modsProfileSel = (std::max)(0, newTotal - 1);
                     if (newTotal == 0) state.modsProfileFocus = 0;
                     pmEnsureVisible();
-                    state.status = L"Removed " + jar;
+                    state.status = removed > 1
+                        ? L"Removed " + jar + L" and " + std::to_wstring(removed - 1) + L" unused dependenc" + (removed == 2 ? L"y" : L"ies")
+                        : L"Removed " + jar;
                 } else if (!state.modsProfileBuiltin) {
                     const std::wstring gone = state.modsProfileName;
                     DeleteProfile(runtimeRoot, state.modsProfileId);
                     state.modsProfileOpen = false;
                     LoadModsTab(state, runtimeRoot, userModsDir);
-                    state.status = L"Deleted " + gone;
+                    state.status = L"Deleted " + gone + L". Use Undo deleted profile to restore it.";
                 }
             } else if ((selectDown && !selectWasDown) || (enterDown && !enterWasDown)) {
                 if (state.modsProfileFocus == 1 && !state.modsProfileBuiltin) {
@@ -8092,7 +8808,17 @@ static void ShowModsPage(
                     DeleteProfile(runtimeRoot, state.modsProfileId);
                     state.modsProfileOpen = false;
                     LoadModsTab(state, runtimeRoot, userModsDir);
-                    state.status = L"Deleted " + gone;
+                    state.status = L"Deleted " + gone + L". Use Undo deleted profile to restore it.";
+                } else if (state.modsProfileFocus == 3 && !state.modsProfileBuiltin) {
+                    std::wstring backupDir;
+                    if (BackupProfile(runtimeRoot, state.modsProfileId, backupDir)) {
+                        LoadModsTab(state, runtimeRoot, userModsDir);
+                        state.status = L"Backed up " + state.modsProfileName;
+                        state.isError = false;
+                    } else {
+                        state.status = L"Could not back up " + state.modsProfileName;
+                        state.isError = true;
+                    }
                 } else if (state.modsProfileFocus == 0) {
                     SetActiveProfileId(runtimeRoot, state.modsProfileId);
                     state.activeProfileId = state.modsProfileId;
@@ -8271,14 +8997,36 @@ static void ShowModsPage(
                         state.selectedModIndex = (std::max)(0, static_cast<int>(state.modsCards.size()) - 1);
                     }
                     ensureSelectionVisible();
-                    state.status = L"Deleted " + deleted;
+                    state.status = L"Deleted " + deleted + L". Use Undo deleted profile to restore it.";
                 }
             }
 
             if (selectDown && !selectWasDown && state.selectedModIndex >= 0 && state.selectedModIndex < count) {
                 ModCard selected = state.modsCards[static_cast<size_t>(state.selectedModIndex)];
                 if (state.selectedModsTab == 0) {
-                    if (selected.projectId == L"__new__") {
+                    if (selected.projectId == L"__restore_deleted__") {
+                        std::wstring restored;
+                        if (RestoreProfileBackup(runtimeRoot, LatestProfileBackup(runtimeRoot, L"deleted"), true, restored)) {
+                            LoadModsTab(state, runtimeRoot, userModsDir);
+                            ensureSelectionVisible();
+                            state.status = L"Restored " + restored;
+                            state.isError = false;
+                        } else {
+                            state.status = L"Could not restore deleted profile";
+                            state.isError = true;
+                        }
+                    } else if (selected.projectId == L"__restore_backup__") {
+                        std::wstring restored;
+                        if (RestoreProfileBackup(runtimeRoot, LatestProfileBackup(runtimeRoot, L"manual"), false, restored)) {
+                            LoadModsTab(state, runtimeRoot, userModsDir);
+                            ensureSelectionVisible();
+                            state.status = L"Restored backup " + restored;
+                            state.isError = false;
+                        } else {
+                            state.status = L"Could not restore profile backup";
+                            state.isError = true;
+                        }
+                    } else if (selected.projectId == L"__new__") {
                         const LaunchTarget target = CurrentModsTarget(state);
                         const std::wstring pid = CreateAutoProfile(runtimeRoot, target);
                         SetActiveProfileId(runtimeRoot, pid);
@@ -10005,8 +10753,10 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
 
     std::vector<std::string> vmOptionStorage;
     vmOptionStorage.reserve(16);
-    vmOptionStorage.push_back("-Xmx4G");
+    vmOptionStorage.push_back("-Xmx3G");
     vmOptionStorage.push_back("-Xms512M");
+    vmOptionStorage.push_back("-XX:MaxDirectMemorySize=512M");
+    WriteLog(L"JVM memory defaults: -Xmx3G -Xms512M -XX:MaxDirectMemorySize=512M");
     vmOptionStorage.push_back("--enable-native-access=ALL-UNNAMED");
     vmOptionStorage.push_back("--add-opens=jdk.zipfs/jdk.nio.zipfs=ALL-UNNAMED");
     const std::wstring selectedJavaBasePatchName =
@@ -10037,6 +10787,20 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     } else {
         WriteLogF(L"Java ZipFS realpath patch missing: %s", javaZipfsPatch.c_str());
     }
+    const bool useJava21DesktopPatch = selectedJavaBasePatchName.find(L"-21.jar") != std::wstring::npos;
+    const std::wstring javaDesktopPatchName = useJava21DesktopPatch ? L"java-desktop-uwp-awt-21.jar" : L"java-desktop-uwp-awt.jar";
+    const std::wstring localJavaDesktopPatch = exeDir + L"\\" + javaDesktopPatchName;
+    const std::wstring packagedJavaDesktopPatch = packageDir + L"\\" + javaDesktopPatchName;
+    const std::wstring javaDesktopPatch =
+        GetFileAttributesW(localJavaDesktopPatch.c_str()) != INVALID_FILE_ATTRIBUTES
+            ? localJavaDesktopPatch
+            : packagedJavaDesktopPatch;
+    if (GetFileAttributesW(javaDesktopPatch.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        vmOptionStorage.push_back("--patch-module=java.desktop=" + w2a(fwd(javaDesktopPatch)));
+        WriteLogF(L"Java desktop UWP AWT patch enabled: %s", javaDesktopPatch.c_str());
+    } else {
+        WriteLogF(L"Java desktop UWP AWT patch missing: %s", javaDesktopPatch.c_str());
+    }
     if (isNeoForge) {
         const std::wstring secureJarHandlerPatchName = L"securejarhandler-uwp-patch.jar";
         const std::wstring localSecureJarHandlerPatch = exeDir + L"\\" + secureJarHandlerPatchName;
@@ -10055,10 +10819,16 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
             vmOptionStorage.push_back("-Dbanditvault.neoforge.minecraftSrgJar=" + w2a(fwd(neoForgeMinecraftSrgJar)));
             WriteLogF(L"NeoForge Minecraft SRG fallback jar: %s", neoForgeMinecraftSrgJar.c_str());
         }
+        vmOptionStorage.push_back("-Dbanditvault.launcherOverrideDir=" + w2a(fwd(launcherOverrideDir)));
     }
     vmOptionStorage.push_back("-Djava.home=" + w2a(fwd(jreDir)));
     vmOptionStorage.push_back("-Djava.security.properties==" + w2a(fwd(jreDir + L"\\conf\\security\\xbox.properties")));
     vmOptionStorage.push_back("-Djava.security.egd=file:/dev/urandom");
+    vmOptionStorage.push_back("-Djava.awt.headless=true");
+    vmOptionStorage.push_back("-Dbanditvault.awt.skipDesktopProperties=true");
+    vmOptionStorage.push_back("-Dswing.defaultlaf=javax.swing.plaf.metal.MetalLookAndFeel");
+    vmOptionStorage.push_back("-Dfml.readTimeout=300");
+    vmOptionStorage.push_back("-Dfml.loginTimeout=300");
     if (isFabric) {
         vmOptionStorage.push_back("-Dfabric.log.file=" + w2a(fwd(fabricLogPath)));
         vmOptionStorage.push_back("-Dfabric.log.level=debug");
@@ -10073,7 +10843,9 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     }
     for (const std::wstring& arg : extraJvmArgs) {
         const std::wstring expanded = expandLaunchArg(arg);
-        if (!expanded.empty()) {
+        if (IsJvmMemoryOption(expanded)) {
+            WriteLogF(L"Ignoring modpack JVM memory override on Xbox: %s", expanded.c_str());
+        } else if (!expanded.empty()) {
             vmOptionStorage.push_back(w2a(expanded));
         }
     }
@@ -10720,6 +11492,36 @@ public:
             cp += fwd(jars[i]);
         }
         WriteLog(L"Launching embedded JVM");
+        const std::vector<std::wstring> launchLogPaths = {
+            g_logDir + L"\\mc_launch.log",
+            g_logDir + L"\\java_output.log",
+            g_logDir + L"\\stderr_stream.log"
+        };
+        AuthScreenRenderer launchRendererInstance;
+        AuthScreenRenderer* launchRenderer = nullptr;
+        if (launchRendererInstance.Initialize(g_authWindow.Get())) {
+            launchRenderer = &launchRendererInstance;
+        }
+        AuthUiState launchState;
+        launchState.showLaunchLog = true;
+        launchState.launchLogText = ReadLaunchLogTailForUi(launchLogPaths);
+        const std::wstring launchDetail = L"Handing off to Minecraft. The game window will take over once GLFW starts.";
+        RenderPreparationProgress(
+            launchRenderer,
+            launchState,
+            L"Starting modpack",
+            launchDetail.c_str(),
+            -1.0f);
+        ProcessAuthUiEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        launchState.launchLogText = ReadLaunchLogTailForUi(launchLogPaths);
+        RenderPreparationProgress(
+            launchRenderer,
+            launchState,
+            L"Starting modpack",
+            launchDetail.c_str(),
+            -1.0f);
+        ProcessAuthUiEvents();
         g_minecraftRunning.store(true);
         const std::wstring effLaunchVersion = versionInfo.launchVersion.empty() ? a2w(kFabricLaunchVersion) : versionInfo.launchVersion;
         const std::wstring effAssetIndex = versionInfo.assetIndex.empty() ? a2w(kMinecraftAssetIndex) : versionInfo.assetIndex;

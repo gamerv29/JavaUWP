@@ -34,6 +34,7 @@ public class JarContentsImpl implements JarContents {
             .findFirst()
             .orElseThrow(() -> new IllegalStateException("Couldn't find UnionFileSystemProvider"));
     private static final Set<String> NAUGHTY_SERVICE_FILES = Set.of("org.codehaus.groovy.runtime.ExtensionModule");
+    private static final Set<String> REPORTED_LAUNCHER_OVERRIDES = java.util.Collections.synchronizedSet(new HashSet<>());
 
     final UnionFileSystem filesystem;
     final JarSigningData signingData = new JarSigningData();
@@ -115,6 +116,11 @@ public class JarContentsImpl implements JarContents {
 
     @Override
     public Optional<URI> findFile(String name) {
+        var launcherOverride = findLauncherOverrideFile(name);
+        if (launcherOverride.isPresent()) {
+            return launcherOverride;
+        }
+
         var rel = filesystem.getPath(name);
         if (this.nameOverrides.containsKey(rel)) {
             rel = this.filesystem.getPath("META-INF", "versions", this.nameOverrides.get(rel).toString()).resolve(rel);
@@ -125,6 +131,28 @@ public class JarContentsImpl implements JarContents {
         }
 
         return findBackingFileUri(name);
+    }
+
+    private Optional<URI> findLauncherOverrideFile(String name) {
+        var overrideDir = System.getProperty("banditvault.launcherOverrideDir", "");
+        if (overrideDir.isBlank() || name.isBlank() || name.contains("..") || name.startsWith("/") || name.startsWith("\\") || name.endsWith(".class")) {
+            return Optional.empty();
+        }
+
+        try {
+            var base = Path.of(overrideDir).toAbsolutePath().normalize();
+            var candidate = base.resolve(name.replace('/', base.getFileSystem().getSeparator().charAt(0))).normalize();
+            if (candidate.startsWith(base) && Files.isRegularFile(candidate)) {
+                var reportKey = name + " -> " + candidate;
+                if (Boolean.getBoolean("banditvault.securejarhandler.debug") && REPORTED_LAUNCHER_OVERRIDES.add(reportKey)) {
+                    System.err.println("[banditvault] JarContentsImpl launcher override resource "
+                            + name + " -> " + candidate);
+                }
+                return Optional.of(candidate.toUri());
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return Optional.empty();
     }
 
     @Override

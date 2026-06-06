@@ -44,6 +44,9 @@ public class ModuleClassLoader extends ClassLoader {
     private static final MethodHandle MODULES_FIND_LOADED_MODULE;
     private static final Set<String> UWP_ADDED_READ_EDGES = Collections.synchronizedSet(new HashSet<>());
     private static final Set<String> UWP_REPORTED_READ_EDGE_MISSES = Collections.synchronizedSet(new HashSet<>());
+    private static final Set<String> UWP_RESOURCE_FALLBACK_MISSES = Collections.synchronizedSet(new HashSet<>());
+    private static final ThreadLocal<Set<String>> UWP_RESOURCE_FALLBACK_IN_PROGRESS = ThreadLocal.withInitial(HashSet::new);
+    private static final ThreadLocal<Set<String>> UWP_LOAD_CLASS_IN_PROGRESS = ThreadLocal.withInitial(HashSet::new);
     private static final Map<String, Module> UWP_SEEN_MODULES = Collections.synchronizedMap(new HashMap<>());
 
     static {
@@ -384,6 +387,27 @@ public class ModuleClassLoader extends ClassLoader {
                 || className.startsWith("com.mojang.math.");
     }
 
+    private static boolean shouldTryResourceFallback(final String className) {
+        if (isMinecraftClass(className)) {
+            return true;
+        }
+        if (Boolean.getBoolean("banditvault.securejarhandler.resourceFallbackAll")) {
+            return true;
+        }
+
+        final var prefixes = System.getProperty("banditvault.securejarhandler.resourceFallbackPrefixes", "");
+        if (prefixes.isBlank()) {
+            return false;
+        }
+        for (var prefix : prefixes.split(",")) {
+            prefix = prefix.trim();
+            if (!prefix.isEmpty() && className.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private Class<?> readerToClass(final ModuleReader reader, final ModuleReference ref, final String name) {
         return defineClassBytes(ref, name, getClassBytes(reader, ref, name));
     }
@@ -487,19 +511,34 @@ public class ModuleClassLoader extends ClassLoader {
     @Override
     protected Class<?> loadClass(final String name, final boolean resolve) throws ClassNotFoundException {
         synchronized (getClassLoadingLock(name)) {
-            var c = findLoadedClass(name);
-            if (c == null) {
-                var index = name.lastIndexOf('.');
-                if (index >= 0) {
-                    final var pname = name.substring(0, index);
-                    if (isMinecraftClass(name) && !isTransformerLoader()) {
-                        c = loadMinecraftClassFromContext(name);
-                    }
-                    if (c == null && this.packageLookup.containsKey(pname)) {
-                        c = findClass(this.packageLookup.get(pname).name(), name);
-                    }
-                    if (c == null) {
-                        c = findClassByResource(name);
+            final var loadKey = System.identityHashCode(this) + ":" + name;
+            final var inProgress = UWP_LOAD_CLASS_IN_PROGRESS.get();
+            if (!inProgress.add(loadKey)) {
+                var recursiveClass = findLoadedClass(name);
+                if (recursiveClass == null) {
+                    recursiveClass = findClassByResource(name, true);
+                }
+                if (recursiveClass == null) {
+                    throw new ClassNotFoundException(name + " (recursive SecureJar delegation by " + getName() + ")");
+                }
+                if (resolve) resolveClass(recursiveClass);
+                return recursiveClass;
+            }
+            try {
+                var c = findLoadedClass(name);
+                if (c == null) {
+                    var index = name.lastIndexOf('.');
+                    if (index >= 0) {
+                        final var pname = name.substring(0, index);
+                        if (isMinecraftClass(name) && !isTransformerLoader()) {
+                            c = loadMinecraftClassFromContext(name);
+                        }
+                        if (c == null && this.packageLookup.containsKey(pname)) {
+                            c = findClass(this.packageLookup.get(pname).name(), name);
+                        }
+                        if (c == null && shouldTryResourceFallback(name)) {
+                            c = findClassByResource(name);
+                        }
                         if (c == null) {
                             if (isMinecraftClass(name)) {
                                 c = loadMinecraftClassFromContext(name);
@@ -507,38 +546,70 @@ public class ModuleClassLoader extends ClassLoader {
                                     throw new ClassNotFoundException(name + " (not found in resolved SecureJar modules by " + getName() + ")");
                                 }
                             } else {
-                                c = this.parentLoaders.getOrDefault(pname, fallbackClassLoader).loadClass(name);
+                                var delegate = this.parentLoaders.getOrDefault(pname, fallbackClassLoader);
+                                if (delegate == this) {
+                                    c = findClassByResource(name, true);
+                                    if (c == null && fallbackClassLoader != this) {
+                                        c = fallbackClassLoader.loadClass(name);
+                                    }
+                                } else {
+                                    c = delegate.loadClass(name);
+                                }
                             }
                         }
                     }
                 }
+                if (c == null) throw new ClassNotFoundException(name);
+                if (resolve) resolveClass(c);
+                return c;
+            } finally {
+                inProgress.remove(loadKey);
             }
-            if (c == null) throw new ClassNotFoundException(name);
-            if (resolve) resolveClass(c);
-            return c;
         }
     }
 
     private Class<?> findClassByResource(final String name) {
-        if (isMinecraftClass(name) && !isTransformerLoader()) {
-            return loadMinecraftClassFromContext(name);
-        }
+        return findClassByResource(name, false);
+    }
 
-        final var resourceName = name.replace('.', '/') + ".class";
-        for (var root : this.resolvedRoots.entrySet()) {
-            var jar = root.getValue().jar();
-            byte[] backingBytes = getBackingClassBytes(root.getValue(), resourceName, name);
-            if (backingBytes.length == 0 && jar.findFile(resourceName).isEmpty()) {
-                continue;
+    private Class<?> findClassByResource(final String name, final boolean force) {
+        if ((!force && !shouldTryResourceFallback(name)) || UWP_RESOURCE_FALLBACK_MISSES.contains(name)) {
+            return null;
+        }
+        final var inProgress = UWP_RESOURCE_FALLBACK_IN_PROGRESS.get();
+        if (!inProgress.add(name)) {
+            return null;
+        }
+        try {
+            if (isMinecraftClass(name) && !isTransformerLoader()) {
+                return loadMinecraftClassFromContext(name);
             }
 
-            System.err.println("[banditvault] ModuleClassLoader UWP package fallback " + name + " -> " + root.getKey());
-            return findClass(root.getKey(), name);
+            final var resourceName = name.replace('.', '/') + ".class";
+            for (var root : this.resolvedRoots.entrySet()) {
+                var jar = root.getValue().jar();
+                byte[] backingBytes = getBackingClassBytes(root.getValue(), resourceName, name);
+                if (backingBytes.length == 0 && jar.findFile(resourceName).isEmpty()) {
+                    continue;
+                }
+
+                System.err.println("[banditvault] ModuleClassLoader UWP package fallback " + name + " -> " + root.getKey());
+                var c = findClass(root.getKey(), name);
+                if (c != null) {
+                    return c;
+                }
+            }
+            if (isMinecraftClass(name)) {
+                var c = findMinecraftClassByReader(name, resourceName);
+                if (c != null) {
+                    return c;
+                }
+            }
+            UWP_RESOURCE_FALLBACK_MISSES.add(name);
+            return null;
+        } finally {
+            inProgress.remove(name);
         }
-        if (isMinecraftClass(name)) {
-            return findMinecraftClassByReader(name, resourceName);
-        }
-        return null;
     }
 
     private Class<?> loadMinecraftClassFromContext(final String name) {
