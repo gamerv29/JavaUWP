@@ -15,6 +15,7 @@ output\BanditLauncher_<appx-version>.appx
 - Windows 10 or Windows 11 SDK.
 - JDK 21 or newer for the main build runtime. Set `JAVA_HOME` if auto detection does not find it. JDK 25 is recommended for release equivalent package builds.
 - An exact JDK 21 install for the packaged Java 21 runtime. Set `JAVA21_HOME` or `JDK21_HOME` if auto detection does not find it.
+- JDK 17 on the build machine if you want the package to include the optional `jre17` runtime for Java 17 catalog targets.
 - Python 3 with Pillow.
 - Desktop install of Git `https://git-scm.com/install/windows`
 - Fabric installer JAR at `staging\cache\tools\fabric-installer.jar`.
@@ -64,7 +65,23 @@ For adding another playable Fabric target, add it to `config\versions.tsv`, make
 
 For adding another playable NeoForge target, the launcher needs matching NeoForge install metadata in the generated manifest and launch provider logic in `MC.Xbox\launch\loaders\neoforge.cpp` (dispatched through `launch\loaders\loader.cpp`). NeoForge generates patched client artifacts on first launch from downloaded official inputs. Do not commit or redistribute generated NeoForge client jars.
 
-Forge catalog entries exist, but `launch\loaders\forge.cpp` is still a stub. See [ARCHITECTURE.md](ARCHITECTURE.md) for the loader plugin layout and where to implement Forge later.
+Forge `1.20.1 + 47.4.20` has an experimental launch provider in `launch\loaders\forge.cpp`. The build also packages a per target Forge controller mod from `forge_controller_mod\`.
+
+Forge build inputs that belong in the repo:
+
+```text
+build\forge-install-profile.json
+```
+
+Place the matching Forge installer locally (not committed) before building Forge patched clients or controller mods:
+
+```text
+build\forge-installer.jar
+```
+
+`scripts\prepare-forge-patched-client.ps1` uses those files to generate or refresh the patched Forge client jar in the local cache. See [PATCHING.md](PATCHING.md) for controller mod details.
+
+For adding another playable Forge target, add it to `config\versions.tsv`, extend `launch\loaders\forge.cpp`, and let `build.ps1` generate the manifest plus any `forge_controller_mod` output under `runtime\version-mods\<target-id>\`.
 
 ## UWP host source layout
 
@@ -313,6 +330,23 @@ If all of those are there, put launcher owned or explicitly allowed mod jars int
 
 For non default Fabric targets, `compat_mod\build_compat_mod.ps1` will call `scripts\prepare-ci-cache.ps1` for the requested Minecraft and loader version if the matching remapped client jar is missing.
 
+`1.20.1` Fabric controller sources live under `compat_mod\src\variants\1.20.1\` because that target uses different intermediary mappings than the default compatibility mod sources.
+
+Build the Forge controller mod directly with:
+
+```powershell
+.\forge_controller_mod\build_forge_controller_mod.ps1
+```
+
+Or build a specific Forge target into `runtime\version-mods\`:
+
+```powershell
+.\forge_controller_mod\build_forge_controller_mod.ps1 `
+  -MinecraftVersion 1.20.1 `
+  -ForgeVersion 1.20.1-47.4.20 `
+  -OutputDir .\runtime\version-mods\1.20.1-forge-47.4.20
+```
+
 ## Patch Fabric Loader
 
 The top level build runs this step automatically. You can also run it directly:
@@ -368,8 +402,8 @@ The build script:
 7. Copies the version catalog.
 8. Copies patched Fabric Loader jars, patched TinyRemapper for legacy Fabric, the securejarhandler patch, bundled mods, log config, natives, Mesa/MobileGlues graphics DLLs, and the JREs.
 9. Generates `download_manifest.tsv` for the default official Minecraft/Fabric runtime downloads.
-10. Generates `runtime\manifests\<target-id>.tsv` for cataloged Fabric and NeoForge targets.
-11. Builds per target compatibility mod jars under `runtime\version-mods`.
+10. Generates `runtime\manifests\<target-id>.tsv` for cataloged Fabric, Forge, and NeoForge targets.
+11. Builds per target compatibility mod jars and Forge controller mod jars under `runtime\version-mods`.
 12. Generates UWP tile and splash assets from `MC.Xbox\Assets\Java_UWP_Icon.png`.
 13. Creates and signs `output\BanditLauncher_<appx-version>.appx`.
 14. Deletes `staging\package` unless `-KeepStaging` is set.
@@ -412,6 +446,8 @@ To include all ignored files, including downloaded cache files:
 - `vswhere.exe not found`: install Visual Studio Build Tools with C++ tools.
 - `Mesa UWP runtime DLLs not found`: pass `-MesaRuntimeDir`, set `MESA_UWP_DIR`, or restore `mesa-runtime\`.
 - Missing `client-intermediary.jar`: run the Fabric client once from the local desktop cache as shown above.
+- `Forge installer jar missing at build\forge-installer.jar`: place the official Forge `1.20.1-47.4.20` installer jar at that path before building Forge controller mods or running `scripts\prepare-forge-patched-client.ps1`.
+- Forge controller compile failure: ensure the patched Forge client exists in the local cache and that `build\forge-install-profile.json` is present.
 - Missing native DLLs: fill `staging\cache\natives-1.21` with the native DLLs required by the Minecraft and LWJGL runtime.
 - First launch downloads every required official file after sign in. A later launch should verify and skip files that are already downloaded.
 - Runtime download failure: check `LocalState\logs\current\mc_launch.log` for the manifest path, URL, HTTP status, or SHA1 mismatch.

@@ -36,7 +36,7 @@ MC.Xbox/
       loader_common.*     Shared loader parsing/helpers
       fabric.*            Fabric launch provider
       neoforge.*          NeoForge launch provider
-      forge.*             Forge stub for future work
+      forge.*             Forge launch provider (1.20.1 implemented)
 ```
 
 `build.ps1` compiles sources from these folders with include paths for `.`, `common`, `net`, `auth`, `ui`, `mods`, `profiles`, `launch`, and `launch/loaders`.
@@ -93,7 +93,8 @@ When version JSON needs loader specific fields, `ResolveVersionInfo()` delegates
 
 `launch/minecraft_launch.cpp` handles the common embed path:
 
-- Locates packaged JREs (`jre`, `jre21`).
+- Locates packaged JREs (`jre`, `jre21`, and `jre17` when packaged for Java 17 targets).
+- Syncs bundled loader mods from `runtime/version-mods/<target-id>/` into the active profile `mods/` folder for Forge and NeoForge launches.
 - Builds the base classpath from resolved version data.
 - Applies UWP native library paths and GLFW shim placement.
 - Calls loader hooks before adjusting classpath and JVM options.
@@ -135,14 +136,23 @@ NeoForge generates patched client artifacts on first launch from downloaded offi
 
 ### Forge
 
-`launch/loaders/forge.cpp` is currently a stub. Catalog entries may exist in `config/versions.tsv`, but `supported = false` and launch attempts log that Forge is not implemented yet.
+`launch/loaders/forge.cpp` implements the experimental `1.20.1 + Forge 47.4.20` provider. It follows the same loader hook pattern as NeoForge:
 
-To add legacy Forge support later:
+- Reads Forge install metadata from the generated download manifest.
+- Prepares SRG client artifacts from downloaded official inputs (similar to NeoForge patched client generation).
+- Assembles Forge classpath and JVM options, including `legacyClassPath` alignment for FML.
+- Runs late artifact preparation after the embedded JVM starts when needed.
 
-1. Implement the loader hooks in `launch/loaders/forge.cpp`.
+Forge patched client jars are generated locally during build or first launch prep from official inputs. Do not commit or redistribute generated Forge client jars.
+
+Other Forge catalog rows (for example `1.18.2`) may exist in `config/versions.tsv` before their providers are implemented.
+
+To add another Forge target:
+
+1. Extend the provider logic in `launch/loaders/forge.cpp`.
 2. Add or update the target row in `config/versions.tsv`.
-3. Ensure `build.ps1` generates the matching manifest and any patched runtime artifacts.
-4. Register the provider in `launch/loaders/loader.cpp` if dispatch rules change.
+3. Ensure `build.ps1` generates the matching manifest and any per target controller mod jar.
+4. Confirm dispatch in `launch/loaders/loader.cpp` covers the new loader version.
 
 ## Build Time vs Runtime Configuration
 
@@ -161,7 +171,8 @@ Changing the default target requires updating `scripts/config.ps1` and usually `
 | Path | Role in launch |
 | --- | --- |
 | `glfw_shim/` | Replaces desktop `glfw.dll` behavior for UWP windowing, input, and EGL. |
-| `compat_mod/` | Seeds launcher owned compatibility fixes into profiles. |
+| `compat_mod/` | Fabric compatibility mod: filesystem, graphics, and controller fixes per target. |
+| `forge_controller_mod/` | Forge Xbox controller mod built into `runtime/version-mods/<target-id>/`. |
 | `patch/` | Supplies patched Fabric Loader classes and securejarhandler UWP changes packaged into the APPX. |
 | `mesa-runtime/` | Series console OpenGL translation runtime packaged under `graphics/`. |
 
@@ -171,7 +182,8 @@ Changing the default target requires updating `scripts/config.ps1` and usually `
 | --- | --- |
 | Add a Fabric target | `config/versions.tsv`, `scripts/config.ps1`, `launch/loaders/fabric.cpp`, [BUILDING.md](BUILDING.md) |
 | Add a NeoForge target | `config/versions.tsv`, manifest generation in `scripts/`, `launch/loaders/neoforge.cpp` |
-| Implement Forge | `launch/loaders/forge.cpp`, then manifest/build follow up |
+| Add another Forge target | `launch/loaders/forge.cpp`, `config/versions.tsv`, `forge_controller_mod/` if controller support is needed |
+| Change bundled controller behavior | `compat_mod/` (Fabric), `forge_controller_mod/` (Forge), `glfw_shim/glfw_uwp.cpp`, `mods/mod_defaults.cpp` |
 | Change sign in or ownership checks | `auth/minecraft_auth.cpp` |
 | Change main menu or auth UI | `ui/launcher_ui.cpp`, `ui/auth_screen` |
 | Change downloads or repair behavior | `launch/runtime_manager.cpp` |
